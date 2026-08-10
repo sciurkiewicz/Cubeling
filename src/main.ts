@@ -18,13 +18,15 @@ import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial';
 import { DynamicTexture } from '@babylonjs/core/Materials/Textures/dynamicTexture';
 import { Texture } from '@babylonjs/core/Materials/Textures/texture';
 import '@babylonjs/core/Rendering/edgesRenderer';
+import '@babylonjs/core/Shaders/line.vertex';
+import '@babylonjs/core/Shaders/line.fragment';
 import { Scene } from '@babylonjs/core/scene';
 import { GLTF2Export } from '@babylonjs/serializers/glTF/2.0/glTFSerializer';
 import { OBJExport } from '@babylonjs/serializers/OBJ/objSerializer';
 import { STLExport } from '@babylonjs/serializers/stl/stlSerializer';
 import { icon } from './icons';
 
-type Tool = 'select' | 'add' | 'erase' | 'paint' | 'texture' | 'shape';
+type Tool = 'select' | 'add' | 'erase' | 'paint' | 'eyedropper' | 'texture' | 'shape';
 type ShapeType = 'box' | 'pyramid' | 'circle' | 'square' | 'plane' | 'billboard';
 type ExportFormat = 'glb' | 'gltf' | 'obj' | 'stl' | 'json';
 
@@ -57,6 +59,23 @@ interface PrimitivePaintCell {
   color: string;
 }
 
+interface TextureLibraryItem {
+  id: string;
+  name: string;
+  data: string;
+  width: number;
+  height: number;
+  pixels?: Uint8ClampedArray;
+}
+
+interface PackedTextureLibraryItem {
+  id: string;
+  name: string;
+  textureId: number;
+  width: number;
+  height: number;
+}
+
 interface CanvasSettings {
   width: number;
   depth: number;
@@ -75,6 +94,7 @@ interface PackedProjectSnapshot {
   textures: string[];
   voxels: PackedVoxelData[];
   primitives: PackedPrimitiveData[];
+  textureLibrary?: PackedTextureLibraryItem[];
 }
 
 const PALETTE = [
@@ -187,6 +207,7 @@ app.innerHTML = `
         <section class="panel-section color-section">
           <div class="section-heading">
             <div><span class="eyebrow">MATERIAŁ</span><h2>Kolor voxela</h2></div>
+            <button class="section-tool-button" id="colorPickerBtn" title="Próbnik koloru (I)">${icon('picker', 17)}</button>
           </div>
           <div class="current-color-row">
             <div class="current-swatch" id="currentSwatch"></div>
@@ -205,6 +226,10 @@ app.innerHTML = `
             <span><strong id="textureName">Wgraj teksturę</strong><small>PNG, JPG lub WebP · max 512 px</small></span>
             ${icon('upload', 17)}
           </button>
+          <div class="texture-library-heading"><span>BIBLIOTEKA PROJEKTU</span><strong id="textureLibraryCount">0</strong></div>
+          <div class="texture-library" id="textureLibrary">
+            <div class="texture-library-empty">Wgrane tekstury pojawią się tutaj i zapiszą się w pliku projektu.</div>
+          </div>
           <div class="texture-actions">
             <span id="textureHelp">Po wgraniu kliknij obiekt, aby ją nałożyć.</span>
             <div><button id="applyTextureAllBtn" hidden>Nałóż na voxele</button><button id="clearTextureBtn" hidden>Usuń</button></div>
@@ -254,6 +279,8 @@ app.innerHTML = `
           <span class="eyebrow">NA SKRÓTY</span>
           <div class="shortcut"><span>Rysuj / Usuń / Maluj</span><div><kbd>B</kbd><kbd>E</kbd><kbd>P</kbd></div></div>
           <div class="shortcut"><span>Nałóż teksturę</span><div><kbd>T</kbd></div></div>
+          <div class="shortcut"><span>Próbnik koloru</span><div><kbd>I</kbd></div></div>
+          <div class="shortcut"><span>Kopiuj / wklej kształt</span><div><kbd>Ctrl</kbd><kbd>C</kbd><kbd>V</kbd></div></div>
           <div class="shortcut"><span>Cofnij</span><div><kbd>Ctrl</kbd><kbd>Z</kbd></div></div>
           <div class="shortcut"><span>Wycentruj model</span><div><kbd>F</kbd></div></div>
         </section>
@@ -309,6 +336,25 @@ app.innerHTML = `
         </div>
       </div>
     </div>
+    <div class="modal-backdrop" id="textureCropModal" hidden>
+      <div class="modal texture-crop-modal" role="dialog" aria-modal="true" aria-labelledby="textureCropTitle">
+        <span class="eyebrow">BIBLIOTEKA TEKSTUR</span>
+        <h2 id="textureCropTitle">Wytnij fragment tekstury</h2>
+        <p>Zaznacz fragment przeciągnięciem. Jeden piksel wycinka odpowiada jednej komórce stempla.</p>
+        <div class="crop-canvas-wrap"><canvas id="textureCropCanvas"></canvas></div>
+        <div class="crop-fields">
+          <label><span>X</span><input id="cropX" type="number" min="0" value="0" /></label>
+          <label><span>Y</span><input id="cropY" type="number" min="0" value="0" /></label>
+          <label><span>Szer.</span><input id="cropWidth" type="number" min="1" value="1" /></label>
+          <label><span>Wys.</span><input id="cropHeight" type="number" min="1" value="1" /></label>
+        </div>
+        <div class="modal-actions crop-actions">
+          <button class="button secondary" id="cancelTextureCrop">Anuluj</button>
+          <button class="button secondary" id="useTextureBase">Dopasuj jako bazę</button>
+          <button class="button primary" id="useTextureStamp">Stempluj fragment</button>
+        </div>
+      </div>
+    </div>
   </div>
 `;
 
@@ -322,6 +368,7 @@ scene.skipPointerMovePicking = false;
 const camera = new ArcRotateCamera('camera', -Math.PI / 4, Math.PI / 3.2, 18, new Vector3(0, 1.5, 0), scene);
 camera.lowerRadiusLimit = 4;
 camera.upperRadiusLimit = 42;
+camera.minZ = 0.05;
 camera.lowerBetaLimit = 0.18;
 camera.upperBetaLimit = Math.PI / 2.04;
 // Procentowy krok utrzymuje tę samą szybkość zoomu na canvasie 32 i 256.
@@ -429,6 +476,8 @@ let currentTexture: string | null = null;
 let currentTexturePixels: Uint8ClampedArray | null = null;
 let currentTexturePixelSize = { width: 0, height: 0 };
 let texturePlacementPending = false;
+let textureStampPending = false;
+const textureLibrary = new Map<string, TextureLibraryItem>();
 let hoveredMesh: Mesh | null = null;
 let hoveredTool: Tool | null = null;
 let previewPosition: Vector3 | null = null;
@@ -436,6 +485,8 @@ let history: ProjectSnapshot[] = [];
 let historyIndex = -1;
 let projectDirty = false;
 let toastTimer: number | undefined;
+let copiedPrimitive: PrimitiveData | null = null;
+let pasteOffset = 0;
 let paintStrokeActive = false;
 let paintStrokeChanged = false;
 const paintedInStroke = new Set<string>();
@@ -552,6 +603,220 @@ selectionBox.enableEdgesRendering(0.999);
 selectionBox.edgesWidth = 2.4;
 selectionBox.edgesColor = new Color4(0.96, 0.34, 0.18, 1);
 selectionBox.setEnabled(false);
+
+const stampPreview = MeshBuilder.CreatePlane('stamp-preview', { size: 1, sideOrientation: Mesh.DOUBLESIDE }, scene);
+const stampPreviewMaterial = new StandardMaterial('stamp-preview-material', scene);
+stampPreviewMaterial.diffuseColor = Color3.White();
+stampPreviewMaterial.ambientColor = new Color3(0.22, 0.22, 0.22);
+stampPreviewMaterial.specularColor = new Color3(0.18, 0.18, 0.18);
+stampPreviewMaterial.alpha = 1;
+stampPreviewMaterial.useAlphaFromDiffuseTexture = true;
+stampPreviewMaterial.disableDepthWrite = true;
+stampPreviewMaterial.zOffset = -2;
+stampPreview.material = stampPreviewMaterial;
+stampPreview.isPickable = false;
+stampPreview.renderingGroupId = 2;
+stampPreview.setEnabled(false);
+let stampPreviewTexture: Texture | null = null;
+
+const stampBoxPreview = MeshBuilder.CreateBox('stamp-box-preview', { size: 1 }, scene);
+stampBoxPreview.isPickable = false;
+stampBoxPreview.renderingGroupId = 2;
+stampBoxPreview.setEnabled(false);
+
+interface StampBoxPreviewResources {
+  signature: string;
+  multiMaterial: MultiMaterial;
+  materials: StandardMaterial[];
+  textures: DynamicTexture[];
+}
+
+let stampBoxPreviewResources: StampBoxPreviewResources | null = null;
+let stampBoxPreviewFace = -1;
+let stampBoxPreviewKey = '';
+
+function stampPixelColorAt(x: number, y: number): string | null {
+  if (!currentTexturePixels) return null;
+  const offset = (y * currentTexturePixelSize.width + x) * 4;
+  if (currentTexturePixels[offset + 3] < 8) return null;
+  return `#${[currentTexturePixels[offset], currentTexturePixels[offset + 1], currentTexturePixels[offset + 2]]
+    .map((value) => value.toString(16).padStart(2, '0')).join('')}`;
+}
+
+function hideStampPreviews(): void {
+  stampPreview.setEnabled(false);
+  stampBoxPreview.setEnabled(false);
+}
+
+function disposeStampBoxPreviewResources(): void {
+  if (!stampBoxPreviewResources) return;
+  stampBoxPreviewResources.textures.forEach((texture) => texture.dispose());
+  stampBoxPreviewResources.materials.forEach((material) => material.dispose(false, false));
+  stampBoxPreviewResources.multiMaterial.dispose(false, false);
+  stampBoxPreviewResources = null;
+  stampBoxPreviewFace = -1;
+  stampBoxPreviewKey = '';
+}
+
+function ensureStampBoxPreviewResources(mesh: Mesh): StampBoxPreviewResources {
+  const signature = `${String(mesh.metadata.id)}:${mesh.metadata.sizeX}:${mesh.metadata.sizeY}:${mesh.metadata.sizeZ}`;
+  if (stampBoxPreviewResources?.signature === signature) return stampBoxPreviewResources;
+  disposeStampBoxPreviewResources();
+  stampBoxPreview.releaseSubMeshes();
+  const multiMaterial = new MultiMaterial('stamp-box-preview-multi-material', scene);
+  const materials: StandardMaterial[] = [];
+  const textures: DynamicTexture[] = [];
+  for (let face = 0; face < 6; face += 1) {
+    const logicalSize = boxFaceGridSize(mesh, face);
+    const texture = new DynamicTexture(
+      `stamp-box-preview-${face}`,
+      {
+        width: Math.min(MAX_PAINT_TEXTURE_SIZE, logicalSize.width),
+        height: Math.min(MAX_PAINT_TEXTURE_SIZE, logicalSize.height),
+      },
+      scene,
+      false,
+      Texture.NEAREST_SAMPLINGMODE,
+    );
+    texture.hasAlpha = true;
+    texture.wrapU = Texture.CLAMP_ADDRESSMODE;
+    texture.wrapV = Texture.CLAMP_ADDRESSMODE;
+    const context = texture.getContext();
+    const textureSize = texture.getSize();
+    context.clearRect(0, 0, textureSize.width, textureSize.height);
+    texture.update(true);
+
+    const material = new StandardMaterial(`stamp-box-preview-material-${face}`, scene);
+    material.diffuseColor = Color3.White();
+    material.ambientColor = new Color3(0.22, 0.22, 0.22);
+    material.specularColor = new Color3(0.18, 0.18, 0.18);
+    material.alpha = 1;
+    material.diffuseTexture = texture;
+    material.useAlphaFromDiffuseTexture = true;
+    material.disableDepthWrite = true;
+    material.zOffset = -3;
+    multiMaterial.subMaterials.push(material);
+    materials.push(material);
+    textures.push(texture);
+    new SubMesh(face, 0, stampBoxPreview.getTotalVertices(), face * 6, 6, stampBoxPreview);
+  }
+  stampBoxPreviewResources = { signature, multiMaterial, materials, textures };
+  stampBoxPreview.material = multiMaterial;
+  return stampBoxPreviewResources;
+}
+
+function clearStampBoxPreviewFace(resources: StampBoxPreviewResources, face: number): void {
+  if (face < 0) return;
+  const texture = resources.textures[face];
+  const textureSize = texture.getSize();
+  texture.getContext().clearRect(0, 0, textureSize.width, textureSize.height);
+  texture.update(true);
+}
+
+function updateBoxStampPreview(
+  mesh: Mesh,
+  normal: Vector3 | null,
+  uv: { x: number; y: number } | null,
+): boolean {
+  const surfaceCell = getBoxSurfaceCell(mesh, normal, uv);
+  if (!surfaceCell || !currentTexturePixels) return false;
+  const resources = ensureStampBoxPreviewResources(mesh);
+  stampBoxPreview.position.copyFrom(mesh.position);
+  stampBoxPreview.rotation.copyFrom(mesh.rotation);
+  stampBoxPreview.scaling.copyFrom(mesh.scaling).scaleInPlace(1.001);
+  stampBoxPreview.setEnabled(true);
+
+  const previewKey = `${resources.signature}:${surfaceCell.face}:${surfaceCell.u}:${surfaceCell.v}`;
+  if (previewKey === stampBoxPreviewKey) return true;
+  if (stampBoxPreviewFace !== surfaceCell.face) clearStampBoxPreviewFace(resources, stampBoxPreviewFace);
+  const texture = resources.textures[surfaceCell.face];
+  const context = texture.getContext();
+  const textureSize = texture.getSize();
+  const faceSize = boxFaceGridSize(mesh, surfaceCell.face);
+  context.clearRect(0, 0, textureSize.width, textureSize.height);
+  const startU = surfaceCell.u - Math.floor(currentTexturePixelSize.width / 2);
+  const startV = surfaceCell.v - Math.floor(currentTexturePixelSize.height / 2);
+  for (let y = 0; y < currentTexturePixelSize.height; y += 1) {
+    for (let x = 0; x < currentTexturePixelSize.width; x += 1) {
+      const u = startU + x;
+      const v = startV + y;
+      if (u < 0 || v < 0 || u >= faceSize.width || v >= faceSize.height) continue;
+      const color = stampPixelColorAt(x, y);
+      if (!color) continue;
+      const x0 = Math.floor(u * textureSize.width / faceSize.width);
+      const y0 = Math.floor(v * textureSize.height / faceSize.height);
+      const x1 = Math.max(x0 + 1, Math.ceil((u + 1) * textureSize.width / faceSize.width));
+      const y1 = Math.max(y0 + 1, Math.ceil((v + 1) * textureSize.height / faceSize.height));
+      context.fillStyle = color;
+      context.fillRect(x0, y0, x1 - x0, y1 - y0);
+    }
+  }
+  texture.update(true);
+  stampBoxPreviewFace = surfaceCell.face;
+  stampBoxPreviewKey = previewKey;
+  return true;
+}
+
+function refreshStampPreviewTexture(): void {
+  stampPreviewTexture?.dispose();
+  stampPreviewTexture = null;
+  hideStampPreviews();
+  stampBoxPreviewKey = '';
+  if (!textureStampPending || !currentTexturePixels || !currentTexturePixelSize.width) return;
+  const texture = new DynamicTexture(
+    'stamp-preview-texture',
+    { width: currentTexturePixelSize.width, height: currentTexturePixelSize.height },
+    scene,
+    false,
+    Texture.NEAREST_SAMPLINGMODE,
+  );
+  const context = texture.getContext();
+  const image = new ImageData(currentTexturePixelSize.width, currentTexturePixelSize.height);
+  for (let index = 0; index < currentTexturePixels.length; index += 4) {
+    image.data[index] = currentTexturePixels[index];
+    image.data[index + 1] = currentTexturePixels[index + 1];
+    image.data[index + 2] = currentTexturePixels[index + 2];
+    image.data[index + 3] = currentTexturePixels[index + 3] < 8 ? 0 : 255;
+  }
+  context.putImageData(image, 0, 0);
+  texture.update(true);
+  texture.hasAlpha = true;
+  texture.wrapU = Texture.CLAMP_ADDRESSMODE;
+  texture.wrapV = Texture.CLAMP_ADDRESSMODE;
+  stampPreviewTexture = texture;
+  stampPreviewMaterial.diffuseTexture = stampPreviewTexture;
+  stampPreviewMaterial.opacityTexture = stampPreviewTexture;
+}
+
+function updateStampPreview(
+  mesh: Mesh,
+  normal: Vector3 | null,
+  uv: { x: number; y: number } | null,
+): void {
+  if (!textureStampPending || !stampPreviewTexture || !currentTexturePixelSize.width) {
+    hideStampPreviews();
+    return;
+  }
+  if (updateBoxStampPreview(mesh, normal, uv)) {
+    stampPreview.setEnabled(false);
+    return;
+  }
+  stampBoxPreview.setEnabled(false);
+  if (!mesh.metadata.isVoxel) return;
+  const logical = getLogicalPosition(mesh);
+  const startX = logical.x - Math.floor(currentTexturePixelSize.width / 2);
+  const startZ = logical.z - Math.floor(currentTexturePixelSize.height / 2);
+  const point = new Vector3(
+    startX + (currentTexturePixelSize.width - 1) / 2,
+    logical.y + 0.501,
+    startZ + (currentTexturePixelSize.height - 1) / 2,
+  );
+  stampPreview.rotation.set(0, 0, 0);
+  stampPreview.rotation.x = Math.PI / 2;
+  stampPreview.scaling.set(currentTexturePixelSize.width, currentTexturePixelSize.height, 1);
+  stampPreview.position.copyFrom(point);
+  stampPreview.setEnabled(true);
+}
 
 const gizmoManager = new GizmoManager(scene);
 gizmoManager.usePointerToAttachGizmos = false;
@@ -812,8 +1077,10 @@ function boxFaceGridSize(mesh: Mesh, face: number): { width: number; height: num
   const y = Number(mesh.metadata.sizeY ?? 1);
   const z = Number(mesh.metadata.sizeZ ?? 1);
   if (face <= 1) return { width: x, height: y };
-  if (face <= 3) return { width: z, height: y };
-  return { width: x, height: z };
+  // Babylon obraca UV ścian ±X: oś U biegnie po Y, a oś V po Z.
+  if (face <= 3) return { width: y, height: z };
+  // Na górze i spodzie U biegnie po Z, a V po X.
+  return { width: z, height: x };
 }
 
 function boxFaceFromNormal(normal: Vector3 | null): number | null {
@@ -1043,8 +1310,7 @@ function serializeVoxels(): VoxelData[] {
     .sort((a, b) => a.y - b.y || a.z - b.z || a.x - b.x);
 }
 
-function serializePrimitives(): PrimitiveData[] {
-  return [...primitives.values()].map((mesh) => {
+function serializePrimitive(mesh: Mesh): PrimitiveData {
     const paint = [...getPaintCells(mesh).entries()].map(([key, color]) => {
       const [face, u, v] = key.split(':').map(Number);
       return { face, u, v, color };
@@ -1062,7 +1328,40 @@ function serializePrimitives(): PrimitiveData[] {
       ...(mesh.metadata.texture ? { texture: String(mesh.metadata.texture) } : {}),
       ...(paint.length ? { paint } : {}),
     };
-  });
+}
+
+function serializePrimitives(): PrimitiveData[] {
+  return [...primitives.values()].map(serializePrimitive);
+}
+
+function copySelectedPrimitive(): void {
+  if (!selectedPrimitiveId) {
+    showToast('Najpierw zaznacz kształt do skopiowania', true);
+    return;
+  }
+  const mesh = primitives.get(selectedPrimitiveId);
+  if (!mesh) return;
+  copiedPrimitive = structuredClone(serializePrimitive(mesh));
+  pasteOffset = 0;
+  showToast(`Skopiowano: ${shapeNames[copiedPrimitive.type]}`);
+}
+
+function pastePrimitive(): void {
+  if (!copiedPrimitive) {
+    showToast('Schowek kształtów jest pusty', true);
+    return;
+  }
+  pasteOffset += 1;
+  const data = structuredClone(copiedPrimitive);
+  data.id = crypto.randomUUID();
+  data.x += pasteOffset;
+  data.z += pasteOffset;
+  const mesh = createPrimitive(data);
+  setTool('select');
+  selectPrimitive(mesh, 'move');
+  pushHistory();
+  updateStats();
+  showToast(`Wklejono kopię · przesunięcie ${pasteOffset} kom.`);
 }
 
 function serializeProject(): ProjectSnapshot {
@@ -1088,6 +1387,13 @@ function packProject(project: ProjectSnapshot): PackedProjectSnapshot {
     textures,
     voxels: project.voxels.map(packItem),
     primitives: project.primitives.map(packItem),
+    textureLibrary: [...textureLibrary.values()].map((item) => ({
+      id: item.id,
+      name: item.name,
+      textureId: getTextureId(item.data),
+      width: item.width,
+      height: item.height,
+    })),
   };
 }
 
@@ -1104,6 +1410,14 @@ function unpackProject(project: { textures?: string[]; voxels?: PackedVoxelData[
     voxels: Array.isArray(project.voxels) ? project.voxels.map((item) => unpackItem(item) as VoxelData) : [],
     primitives: Array.isArray(project.primitives) ? project.primitives.map((item) => unpackItem(item) as PrimitiveData) : [],
   };
+}
+
+function unpackTextureLibrary(textures: string[], library: PackedTextureLibraryItem[] = []): TextureLibraryItem[] {
+  return library.map((item) => {
+    const data = textures[item.textureId];
+    if (!data) throw new Error('Brak pliku tekstury w bibliotece');
+    return { id: item.id, name: item.name, data, width: item.width, height: item.height };
+  });
 }
 
 function loadProject(data: ProjectSnapshot): void {
@@ -1204,6 +1518,48 @@ function eraseObject(mesh: Mesh): void {
   updateStats();
 }
 
+function getBoxSurfaceCell(
+  mesh: Mesh,
+  normal: Vector3 | null,
+  uv: { x: number; y: number } | null,
+): { key: string; face: number; u: number; v: number } | null {
+  const kind = mesh.metadata.kind as ShapeType | 'voxel';
+  if (mesh.metadata.isVoxel || (kind !== 'box' && kind !== 'square') || !uv) return null;
+  const face = boxFaceFromNormal(normal);
+  if (face === null) return null;
+  const size = boxFaceGridSize(mesh, face);
+  const u = Math.max(0, Math.min(size.width - 1, Math.floor(uv.x * size.width)));
+  const v = Math.max(0, Math.min(size.height - 1, Math.floor((1 - uv.y) * size.height)));
+  return { key: `${face}:${u}:${v}`, face, u, v };
+}
+
+function colorFromPixels(source: PixelTextureData, u: number, v: number): string | null {
+  const x = Math.max(0, Math.min(source.width - 1, Math.floor(u * source.width)));
+  const y = Math.max(0, Math.min(source.height - 1, Math.floor(v * source.height)));
+  const offset = (y * source.width + x) * 4;
+  if (source.pixels[offset + 3] < 8) return null;
+  return `#${[source.pixels[offset], source.pixels[offset + 1], source.pixels[offset + 2]]
+    .map((value) => value.toString(16).padStart(2, '0')).join('')}`;
+}
+
+function sampleObjectColor(
+  mesh: Mesh,
+  normal: Vector3 | null,
+  uv: { x: number; y: number } | null,
+): string {
+  const cell = getBoxSurfaceCell(mesh, normal, uv);
+  if (cell) {
+    const paintedColor = getPaintCells(mesh).get(cell.key);
+    if (paintedColor) return paintedColor;
+    const baseTexture = mesh.metadata.baseTexturePixels as PixelTextureData | undefined;
+    if (baseTexture && uv) {
+      const textureColor = colorFromPixels(baseTexture, uv.x, 1 - uv.y);
+      if (textureColor) return textureColor;
+    }
+  }
+  return String(mesh.metadata.color ?? currentColor);
+}
+
 function paintObject(
   mesh: Mesh,
   commit = true,
@@ -1211,16 +1567,7 @@ function paintObject(
   uv: { x: number; y: number } | null = null,
 ): boolean {
   const logical = getLogicalPosition(mesh);
-  const kind = mesh.metadata.kind as ShapeType | 'voxel';
-  const isPaintableBox = !mesh.metadata.isVoxel && (kind === 'box' || kind === 'square');
-  const face = isPaintableBox ? boxFaceFromNormal(normal) : null;
-  let paintCell: { key: string; face: number; u: number; v: number } | null = null;
-  if (isPaintableBox && face !== null && uv) {
-    const size = boxFaceGridSize(mesh, face);
-    const u = Math.max(0, Math.min(size.width - 1, Math.floor(uv.x * size.width)));
-    const v = Math.max(0, Math.min(size.height - 1, Math.floor((1 - uv.y) * size.height)));
-    paintCell = { key: `${face}:${u}:${v}`, face, u, v };
-  }
+  const paintCell = getBoxSurfaceCell(mesh, normal, uv);
   const targetKey = paintCell
     ? `p-${String(mesh.metadata.id)}-${paintCell.key}`
     : mesh.metadata.isVoxel ? `v-${keyOf(logical.x, logical.y, logical.z)}` : `p-${String(mesh.metadata.id)}`;
@@ -1307,6 +1654,64 @@ function textureObject(mesh: Mesh): void {
   showToast(nextTexture ? 'Tekstura dopasowana do siatki — możesz po niej malować' : 'Tekstura została usunięta');
 }
 
+function stampTextureOnObject(
+  mesh: Mesh,
+  normal: Vector3 | null,
+  uv: { x: number; y: number } | null,
+): boolean {
+  if (!currentTexturePixels || !currentTexturePixelSize.width || !currentTexturePixelSize.height) return false;
+  const surfaceCell = getBoxSurfaceCell(mesh, normal, uv);
+  let changed = 0;
+  if (surfaceCell) {
+    const faceSize = boxFaceGridSize(mesh, surfaceCell.face);
+    const startU = surfaceCell.u - Math.floor(currentTexturePixelSize.width / 2);
+    const startV = surfaceCell.v - Math.floor(currentTexturePixelSize.height / 2);
+    const cells = getPaintCells(mesh);
+    ensureBoxPaintResources(mesh);
+    for (let y = 0; y < currentTexturePixelSize.height; y += 1) {
+      for (let x = 0; x < currentTexturePixelSize.width; x += 1) {
+        const u = startU + x;
+        const v = startV + y;
+        if (u < 0 || v < 0 || u >= faceSize.width || v >= faceSize.height) continue;
+        const color = stampPixelColorAt(x, y);
+        if (!color) continue;
+        const key = `${surfaceCell.face}:${u}:${v}`;
+        if (cells.get(key) === color) continue;
+        cells.set(key, color);
+        fillBoxPaintCell(mesh, surfaceCell.face, u, v, color);
+        changed += 1;
+      }
+    }
+    if (changed) schedulePaintTextureUpdate(mesh, surfaceCell.face);
+  } else if (mesh.metadata.isVoxel) {
+    const anchor = getLogicalPosition(mesh);
+    const startX = anchor.x - Math.floor(currentTexturePixelSize.width / 2);
+    const startZ = anchor.z - Math.floor(currentTexturePixelSize.height / 2);
+    for (let y = 0; y < currentTexturePixelSize.height; y += 1) {
+      for (let x = 0; x < currentTexturePixelSize.width; x += 1) {
+        const voxel = voxels.get(keyOf(startX + x, anchor.y, startZ + y));
+        const color = stampPixelColorAt(x, y);
+        if (!voxel || !color || voxel.metadata.color === color) continue;
+        voxel.metadata.texture = undefined;
+        voxel.metadata.color = color;
+        voxel.material = getMaterial(color);
+        changed += 1;
+      }
+    }
+  } else {
+    showToast('Stempel pikselowy działa na Boxach i modelach voxelowych', true);
+    return false;
+  }
+  if (!changed) {
+    showToast('Stempel nie trafił w żadną nową komórkę', true);
+    return false;
+  }
+  flushPaintTextureUpdates();
+  pushHistory();
+  showToast(`Przystemplowano ${changed} ${changed === 1 ? 'piksel' : 'pikseli'}`);
+  return true;
+}
+
 function getLogicalPosition(mesh: Mesh): Vector3 {
   return mesh.metadata?.logicalPosition instanceof Vector3 ? mesh.metadata.logicalPosition : mesh.position;
 }
@@ -1339,6 +1744,7 @@ scene.onPointerObservable.add((pointerInfo) => {
   if (pointerInfo.type === PointerEventTypes.POINTERMOVE) {
     const pick = pointerInfo.pickInfo;
     preview.setEnabled(false);
+    hideStampPreviews();
     previewPosition = null;
     document.querySelector('#coordinates')!.textContent = 'X —   Y —   Z —';
 
@@ -1366,6 +1772,10 @@ scene.onPointerObservable.add((pointerInfo) => {
       hoveredMesh = nextHovered;
       hoveredTool = currentTool;
       if (hoveredMesh) applyHoverOutline(hoveredMesh);
+    }
+
+    if (currentTool === 'paint' && textureStampPending && pickedMesh.metadata?.isModel) {
+      updateStampPreview(pickedMesh, normal, pick?.getTextureCoordinates() ?? null);
     }
 
     if (currentTool === 'add' || currentTool === 'shape') {
@@ -1409,7 +1819,16 @@ scene.onPointerObservable.add((pointerInfo) => {
       addPrimitive(getSnappedEditPosition(mesh, point, normal));
     } else if (mesh.metadata?.isModel && currentTool === 'erase') {
       eraseObject(mesh);
+    } else if (mesh.metadata?.isModel && currentTool === 'eyedropper') {
+      const sampledColor = sampleObjectColor(mesh, normal, pick?.getTextureCoordinates() ?? null);
+      activateColorBrush(sampledColor);
+      setTool('paint');
+      showToast(`Pobrano kolor ${sampledColor.toUpperCase()}`);
     } else if (mesh.metadata?.isModel && currentTool === 'paint') {
+      if (textureStampPending) {
+        stampTextureOnObject(mesh, normal, pick?.getTextureCoordinates() ?? null);
+        return;
+      }
       if (texturePlacementPending && currentTexture) {
         textureObject(mesh);
         texturePlacementPending = false;
@@ -1436,6 +1855,22 @@ window.addEventListener('pointerup', () => {
 // Wymuszamy świeży picking podczas przeciągania. Babylon może zwrócić w
 // POINTERMOVE wynik z poprzedniej klatki, szczególnie przy szybkich ruchach.
 canvas.addEventListener('pointermove', (event) => {
+  if (currentTool === 'paint' && textureStampPending) {
+    const stampPick = scene.pick(
+      scene.pointerX,
+      scene.pointerY,
+      (candidate) => Boolean(candidate.metadata?.isModel),
+    );
+    hideStampPreviews();
+    if (stampPick?.hit && stampPick.pickedMesh && stampPick.pickedPoint) {
+      updateStampPreview(
+        stampPick.pickedMesh as Mesh,
+        stampPick.getNormal(true),
+        stampPick.getTextureCoordinates(),
+      );
+    }
+    return;
+  }
   if (texturePlacementPending || !paintStrokeActive || currentTool !== 'paint' || (event.buttons & 1) === 0) return;
   const pick = scene.pick(
     scene.pointerX,
@@ -1486,9 +1921,11 @@ function setTool(tool: Tool): void {
     hoveredMesh = null;
   }
   hoveredTool = null;
-  (document.querySelector('.color-section') as HTMLElement).hidden = tool !== 'paint';
+  if (tool !== 'paint') hideStampPreviews();
+  (document.querySelector('.color-section') as HTMLElement).hidden = tool !== 'paint' && tool !== 'eyedropper';
   (document.querySelector('.texture-section') as HTMLElement).hidden = tool !== 'paint';
-  canvas.style.cursor = tool === 'erase' ? 'crosshair' : tool === 'paint' || tool === 'texture' ? 'cell' : 'copy';
+  document.querySelector('#colorPickerBtn')?.classList.toggle('active', tool === 'eyedropper');
+  canvas.style.cursor = tool === 'erase' || tool === 'eyedropper' ? 'crosshair' : tool === 'paint' || tool === 'texture' ? 'cell' : 'copy';
 }
 
 document.querySelectorAll<HTMLButtonElement>('[data-tool]').forEach((button) => {
@@ -1503,6 +1940,10 @@ document.querySelectorAll<HTMLButtonElement>('[data-tool]').forEach((button) => 
 });
 document.querySelectorAll<HTMLButtonElement>('[data-mode-tool]').forEach((button) => {
   button.addEventListener('click', () => setTool(button.dataset.modeTool as Tool));
+});
+document.querySelector('#colorPickerBtn')!.addEventListener('click', () => {
+  setTool('eyedropper');
+  showToast('Kliknij komórkę modelu, aby pobrać jej kolor');
 });
 
 const shapePopover = document.querySelector('#shapePopover') as HTMLElement;
@@ -1597,6 +2038,14 @@ function setColor(color: string): void {
   });
 }
 
+function activateColorBrush(color: string): void {
+  texturePlacementPending = false;
+  textureStampPending = false;
+  refreshStampPreviewTexture();
+  setColor(color);
+  if (currentTexture) document.querySelector('#textureHelp')!.textContent = 'Pędzel koloru aktywny. Tekstura pozostaje bazą modelu.';
+}
+
 const palette = document.querySelector('#palette')!;
 PALETTE.forEach((color) => {
   const button = document.createElement('button');
@@ -1606,13 +2055,13 @@ PALETTE.forEach((color) => {
   button.title = color.toUpperCase();
   button.setAttribute('aria-label', `Wybierz kolor ${color}`);
   button.innerHTML = `<span>${icon('check', 13)}</span>`;
-  button.addEventListener('click', () => setColor(color));
+  button.addEventListener('click', () => activateColorBrush(color));
   palette.append(button);
 });
 setColor(currentColor);
 
 document.querySelector('#customColor')!.addEventListener('input', (event) => {
-  setColor((event.target as HTMLInputElement).value);
+  activateColorBrush((event.target as HTMLInputElement).value);
 });
 
 function setCurrentTexture(
@@ -1645,6 +2094,7 @@ function setCurrentTexture(
     (document.querySelector('#applyTextureAllBtn') as HTMLButtonElement).hidden = false;
   } else {
     texturePlacementPending = false;
+    textureStampPending = false;
     previewElement.classList.add('empty');
     previewElement.style.backgroundImage = '';
     previewElement.innerHTML = icon('texture', 20);
@@ -1653,7 +2103,199 @@ function setCurrentTexture(
     clearButton.hidden = true;
     (document.querySelector('#applyTextureAllBtn') as HTMLButtonElement).hidden = true;
   }
+  refreshStampPreviewTexture();
 }
+
+const textureCropModal = document.querySelector('#textureCropModal') as HTMLElement;
+const textureCropCanvas = document.querySelector('#textureCropCanvas') as HTMLCanvasElement;
+const cropInputs = {
+  x: document.querySelector('#cropX') as HTMLInputElement,
+  y: document.querySelector('#cropY') as HTMLInputElement,
+  width: document.querySelector('#cropWidth') as HTMLInputElement,
+  height: document.querySelector('#cropHeight') as HTMLInputElement,
+};
+let cropTextureItem: TextureLibraryItem | null = null;
+let cropBitmap: ImageBitmap | null = null;
+let cropDragStart: { x: number; y: number } | null = null;
+let cropSelection = { x: 0, y: 0, width: 1, height: 1 };
+let cropOpenRequest = 0;
+
+function renderTextureLibrary(): void {
+  const container = document.querySelector('#textureLibrary') as HTMLElement;
+  container.innerHTML = '';
+  document.querySelector('#textureLibraryCount')!.textContent = String(textureLibrary.size);
+  if (!textureLibrary.size) {
+    const empty = document.createElement('div');
+    empty.className = 'texture-library-empty';
+    empty.textContent = 'Wgrane tekstury pojawią się tutaj i zapiszą się w pliku projektu.';
+    container.append(empty);
+    return;
+  }
+  textureLibrary.forEach((item) => {
+    const button = document.createElement('button');
+    button.className = 'texture-library-item';
+    button.title = `${item.name} · ${item.width}×${item.height}`;
+    const image = document.createElement('img');
+    image.src = item.data;
+    image.alt = '';
+    const label = document.createElement('span');
+    label.textContent = item.name;
+    button.append(image, label);
+    button.addEventListener('click', () => void openTextureCrop(item));
+    container.append(button);
+  });
+}
+
+function syncCropInputs(): void {
+  cropInputs.x.value = String(cropSelection.x);
+  cropInputs.y.value = String(cropSelection.y);
+  cropInputs.width.value = String(cropSelection.width);
+  cropInputs.height.value = String(cropSelection.height);
+}
+
+function normalizeCropSelection(selection = cropSelection): void {
+  if (!cropTextureItem) return;
+  const x = Math.max(0, Math.min(cropTextureItem.width - 1, Math.round(selection.x)));
+  const y = Math.max(0, Math.min(cropTextureItem.height - 1, Math.round(selection.y)));
+  cropSelection = {
+    x,
+    y,
+    width: Math.max(1, Math.min(cropTextureItem.width - x, Math.round(selection.width))),
+    height: Math.max(1, Math.min(cropTextureItem.height - y, Math.round(selection.height))),
+  };
+  syncCropInputs();
+}
+
+function drawTextureCrop(): void {
+  if (!cropBitmap || !cropTextureItem) return;
+  const context = textureCropCanvas.getContext('2d');
+  if (!context) return;
+  context.imageSmoothingEnabled = false;
+  context.clearRect(0, 0, textureCropCanvas.width, textureCropCanvas.height);
+  context.drawImage(cropBitmap, 0, 0, textureCropCanvas.width, textureCropCanvas.height);
+  context.fillStyle = 'rgba(22, 22, 20, .52)';
+  const { x, y, width, height } = cropSelection;
+  context.fillRect(0, 0, textureCropCanvas.width, y);
+  context.fillRect(0, y + height, textureCropCanvas.width, textureCropCanvas.height - y - height);
+  context.fillRect(0, y, x, height);
+  context.fillRect(x + width, y, textureCropCanvas.width - x - width, height);
+  context.strokeStyle = '#ffffff';
+  context.lineWidth = Math.max(1, Math.min(textureCropCanvas.width, textureCropCanvas.height) / 160);
+  context.setLineDash([4, 3]);
+  context.strokeRect(x + 0.5, y + 0.5, Math.max(0, width - 1), Math.max(0, height - 1));
+  context.setLineDash([]);
+}
+
+async function openTextureCrop(item: TextureLibraryItem): Promise<void> {
+  const request = ++cropOpenRequest;
+  cropBitmap?.close();
+  const response = await fetch(item.data);
+  const bitmap = await createImageBitmap(await response.blob());
+  if (request !== cropOpenRequest) {
+    bitmap.close();
+    return;
+  }
+  cropTextureItem = item;
+  cropBitmap = bitmap;
+  textureCropCanvas.width = item.width;
+  textureCropCanvas.height = item.height;
+  cropSelection = { x: 0, y: 0, width: item.width, height: item.height };
+  syncCropInputs();
+  drawTextureCrop();
+  document.querySelector('#textureCropTitle')!.textContent = `Wytnij: ${item.name}`;
+  textureCropModal.hidden = false;
+}
+
+function closeTextureCrop(): void {
+  cropOpenRequest += 1;
+  textureCropModal.hidden = true;
+  cropDragStart = null;
+  cropBitmap?.close();
+  cropBitmap = null;
+  cropTextureItem = null;
+}
+
+function cropPointFromEvent(event: PointerEvent): { x: number; y: number } {
+  const bounds = textureCropCanvas.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.min(textureCropCanvas.width - 1, Math.floor((event.clientX - bounds.left) * textureCropCanvas.width / bounds.width))),
+    y: Math.max(0, Math.min(textureCropCanvas.height - 1, Math.floor((event.clientY - bounds.top) * textureCropCanvas.height / bounds.height))),
+  };
+}
+
+textureCropCanvas.addEventListener('pointerdown', (event) => {
+  cropDragStart = cropPointFromEvent(event);
+  textureCropCanvas.setPointerCapture(event.pointerId);
+  cropSelection = { ...cropDragStart, width: 1, height: 1 };
+  syncCropInputs();
+  drawTextureCrop();
+});
+textureCropCanvas.addEventListener('pointermove', (event) => {
+  if (!cropDragStart) return;
+  const point = cropPointFromEvent(event);
+  cropSelection = {
+    x: Math.min(cropDragStart.x, point.x),
+    y: Math.min(cropDragStart.y, point.y),
+    width: Math.abs(point.x - cropDragStart.x) + 1,
+    height: Math.abs(point.y - cropDragStart.y) + 1,
+  };
+  syncCropInputs();
+  drawTextureCrop();
+});
+textureCropCanvas.addEventListener('pointerup', () => { cropDragStart = null; });
+
+Object.values(cropInputs).forEach((input) => {
+  input.addEventListener('change', () => {
+    normalizeCropSelection({
+      x: Number(cropInputs.x.value),
+      y: Number(cropInputs.y.value),
+      width: Number(cropInputs.width.value),
+      height: Number(cropInputs.height.value),
+    });
+    drawTextureCrop();
+  });
+});
+
+async function ensureTextureAssetPixels(item: TextureLibraryItem): Promise<PixelTextureData> {
+  if (item.pixels) return { pixels: item.pixels, width: item.width, height: item.height };
+  const decoded = await decodeTexturePixels(item.data);
+  item.pixels = decoded.pixels;
+  item.width = decoded.width;
+  item.height = decoded.height;
+  return decoded;
+}
+
+async function useTextureCrop(mode: 'base' | 'stamp'): Promise<void> {
+  if (!cropTextureItem) return;
+  const item = cropTextureItem;
+  normalizeCropSelection();
+  const source = await ensureTextureAssetPixels(item);
+  const pixels = new Uint8ClampedArray(cropSelection.width * cropSelection.height * 4);
+  for (let row = 0; row < cropSelection.height; row += 1) {
+    const sourceStart = ((cropSelection.y + row) * source.width + cropSelection.x) * 4;
+    const sourceEnd = sourceStart + cropSelection.width * 4;
+    pixels.set(source.pixels.subarray(sourceStart, sourceEnd), row * cropSelection.width * 4);
+  }
+  const output = document.createElement('canvas');
+  output.width = cropSelection.width;
+  output.height = cropSelection.height;
+  output.getContext('2d')?.putImageData(new ImageData(pixels, output.width, output.height), 0, 0);
+  const data = output.toDataURL('image/png');
+  texturePlacementPending = mode === 'base';
+  textureStampPending = mode === 'stamp';
+  setCurrentTexture(data, `${item.name} · wycinek ${output.width}×${output.height}`, pixels, { width: output.width, height: output.height });
+  closeTextureCrop();
+  setTool('paint');
+  document.querySelector('#textureHelp')!.textContent = mode === 'stamp'
+    ? 'Stempel aktywny: kliknij model. Przezroczyste piksele zostaną pominięte.'
+    : 'Kliknij model, aby dopasować wycinek jako bazę tekstury.';
+  showToast(mode === 'stamp' ? `Stempel ${output.width}×${output.height} gotowy` : 'Wycinek gotowy do nałożenia');
+}
+
+document.querySelector('#cancelTextureCrop')!.addEventListener('click', closeTextureCrop);
+document.querySelector('#useTextureBase')!.addEventListener('click', () => void useTextureCrop('base'));
+document.querySelector('#useTextureStamp')!.addEventListener('click', () => void useTextureCrop('stamp'));
+textureCropModal.addEventListener('click', (event) => { if (event.target === textureCropModal) closeTextureCrop(); });
 
 async function processTextureFile(file: File): Promise<void> {
   if (file.size > 8 * 1024 * 1024) {
@@ -1673,10 +2315,22 @@ async function processTextureFile(file: File): Promise<void> {
     const pixels = context.getImageData(0, 0, textureCanvas.width, textureCanvas.height).data;
     const outputType = file.type === 'image/png' ? 'image/png' : file.type === 'image/webp' ? 'image/webp' : 'image/jpeg';
     const dataUrl = textureCanvas.toDataURL(outputType, 0.9);
-    texturePlacementPending = true;
-    setCurrentTexture(dataUrl, `${file.name} · ${textureCanvas.width}×${textureCanvas.height}`, pixels, { width: textureCanvas.width, height: textureCanvas.height });
-    setTool('paint');
-    showToast('Kliknij obiekt — tekstura dopasuje się do jego siatki');
+    let item = [...textureLibrary.values()].find((candidate) => candidate.data === dataUrl);
+    if (!item) {
+      item = {
+        id: crypto.randomUUID(),
+        name: file.name,
+        data: dataUrl,
+        width: textureCanvas.width,
+        height: textureCanvas.height,
+        pixels,
+      };
+      textureLibrary.set(item.id, item);
+      setProjectDirty(true);
+    }
+    renderTextureLibrary();
+    await openTextureCrop(item);
+    showToast('Tekstura dodana do biblioteki projektu');
   } catch {
     showToast('Nie udało się odczytać tekstury', true);
   }
@@ -1750,6 +2404,7 @@ function updateStats(): void {
   if (!count) {
     document.querySelector('#modelSize')!.textContent = '0 × 0 × 0';
     document.querySelector('#layerCount')!.textContent = '0';
+    camera.lowerRadiusLimit = 4;
     return;
   }
   const xs = data.map((v) => v.x);
@@ -1758,6 +2413,12 @@ function updateStats(): void {
   const dimensions = `${Math.max(...xs) - Math.min(...xs) + 1} × ${Math.max(...ys) - Math.min(...ys) + 1} × ${Math.max(...zs) - Math.min(...zs) + 1}`;
   document.querySelector('#modelSize')!.textContent = dimensions;
   document.querySelector('#layerCount')!.textContent = String(new Set(ys).size);
+  const modelDiagonal = Vector3.Distance(
+    new Vector3(Math.min(...xs), Math.min(...ys), Math.min(...zs)),
+    new Vector3(Math.max(...xs), Math.max(...ys), Math.max(...zs)),
+  );
+  camera.lowerRadiusLimit = Math.max(3, Math.min(12, modelDiagonal * 0.6 + 1));
+  if (camera.radius < camera.lowerRadiusLimit) camera.radius = camera.lowerRadiusLimit;
 }
 
 function frameModel(): void {
@@ -1809,7 +2470,7 @@ async function exportModel(format: ExportFormat): Promise<void> {
   try {
     if (format === 'json') {
       const projectName = (document.querySelector('#projectName') as HTMLInputElement).value.trim() || 'Mój model';
-      const payload = { format: 'cubeling', version: 5, name: projectName, canvas: canvasSettings, ...packProject(serializeProject()) };
+      const payload = { format: 'cubeling', version: 6, name: projectName, canvas: canvasSettings, ...packProject(serializeProject()) };
       downloadBlob(JSON.stringify(payload, null, 2), `${name}.cubeling.json`, 'application/json');
       setProjectDirty(false);
     } else if (format === 'glb') {
@@ -1846,13 +2507,26 @@ function importProject(file: File): void {
   const reader = new FileReader();
   reader.onload = () => {
     try {
-      const parsed = JSON.parse(String(reader.result)) as { name?: string; canvas?: CanvasSettings; textures?: string[]; voxels?: PackedVoxelData[]; primitives?: PackedPrimitiveData[] };
+      const parsed = JSON.parse(String(reader.result)) as {
+        name?: string;
+        canvas?: CanvasSettings;
+        textures?: string[];
+        voxels?: PackedVoxelData[];
+        primitives?: PackedPrimitiveData[];
+        textureLibrary?: PackedTextureLibraryItem[];
+      };
       const validTexture = (texture?: string) => texture === undefined || /^data:image\/(png|jpeg|webp);base64,/i.test(texture);
       const validPosition = (item: { x: number; y: number; z: number; color: string; texture?: string }) => Number.isInteger(item.x)
         && Number.isInteger(item.y) && Number.isInteger(item.z) && /^#[0-9a-f]{6}$/i.test(item.color) && validTexture(item.texture);
       const validShapes: ShapeType[] = ['box', 'pyramid', 'circle', 'square', 'plane', 'billboard'];
       if (parsed.textures && (!Array.isArray(parsed.textures) || !parsed.textures.every((texture) => validTexture(texture)))) {
         throw new Error('Nieprawidłowa biblioteka tekstur');
+      }
+      const importedLibrary = Array.isArray(parsed.textureLibrary) ? parsed.textureLibrary : [];
+      if (!importedLibrary.every((item) => typeof item.id === 'string' && typeof item.name === 'string'
+        && Number.isInteger(item.textureId) && Number.isInteger(item.width) && item.width > 0 && item.width <= 512
+        && Number.isInteger(item.height) && item.height > 0 && item.height <= 512)) {
+        throw new Error('Nieprawidłowe pliki w bibliotece tekstur');
       }
       if (!Array.isArray(parsed.voxels) || !parsed.voxels.every((item) => validPosition(item)
         && (item.textureId === undefined || Number.isInteger(item.textureId)))) {
@@ -1868,6 +2542,7 @@ function importProject(file: File): void {
           && Number.isInteger(cell.v) && cell.v >= 0 && /^#[0-9a-f]{6}$/i.test(cell.color)))
         && (item.textureId === undefined || Number.isInteger(item.textureId)))) throw new Error('Nieprawidłowe kształty');
       const project = unpackProject({ ...parsed, primitives: importedPrimitives.map((item) => ({ ...item, id: item.id || crypto.randomUUID() })) });
+      const library = unpackTextureLibrary(Array.isArray(parsed.textures) ? parsed.textures : [], importedLibrary);
       const importedCanvas = parsed.canvas && isValidCanvasSettings(parsed.canvas) ? parsed.canvas : canvasSettings;
       if (parsed.canvas && isValidCanvasSettings(parsed.canvas)) {
         canvasSettings = { ...importedCanvas };
@@ -1875,6 +2550,10 @@ function importProject(file: File): void {
         applyCanvasVisuals(true);
       }
       loadProject(project);
+      textureLibrary.clear();
+      library.forEach((item) => textureLibrary.set(item.id, item));
+      setCurrentTexture(null);
+      renderTextureLibrary();
       if (parsed.name) {
         (document.querySelector('#projectName') as HTMLInputElement).value = parsed.name.slice(0, 48);
         document.querySelector('#modelNameDisplay')!.textContent = parsed.name.slice(0, 48);
@@ -2017,11 +2696,22 @@ window.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
     shapePopover.hidden = true;
     shapeSizeModal.hidden = true;
+    closeTextureCrop();
     exportMenu.hidden = true;
     exportButton.setAttribute('aria-expanded', 'false');
     modal.hidden = true;
     setupModal.hidden = true;
     clearSelection();
+    return;
+  }
+  if (!isTyping && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'c') {
+    event.preventDefault();
+    copySelectedPrimitive();
+    return;
+  }
+  if (!isTyping && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'v') {
+    event.preventDefault();
+    pastePrimitive();
     return;
   }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
@@ -2040,6 +2730,7 @@ window.addEventListener('keydown', (event) => {
   if (key === 'b') setTool('add');
   if (key === 'e') setTool('erase');
   if (key === 'p') setTool('paint');
+  if (key === 'i') setTool('eyedropper');
   if (key === 't') {
     setTool('paint');
     (document.querySelector('#textureInput') as HTMLInputElement).click();
@@ -2058,6 +2749,7 @@ function initializeProject(): void {
 initializeProject();
 document.querySelector<HTMLButtonElement>('[data-shape="box"]')?.classList.add('selected');
 setCurrentTexture(null);
+renderTextureLibrary();
 setTool('add');
 if (!canvasConfigured) openCanvasSetup(false);
 engine.runRenderLoop(() => scene.render());

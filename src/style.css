@@ -138,6 +138,8 @@ button { color: inherit; }
 .section-heading.collapsible svg { transform: rotate(90deg); color: #a2a39c; }
 .eyebrow { display: block; margin-bottom: 5px; color: #a2a39b; font: 500 8px/1 'DM Mono', monospace; letter-spacing: .13em; }
 .section-heading h2 { font-size: 13px; margin: 0; font-weight: 650; letter-spacing: -.015em; }
+.section-tool-button { width: 29px; height: 29px; display: grid; place-items: center; padding: 0; color: #777970; background: #ecebe4; border: 1px solid #d4d2ca; border-radius: 6px; cursor: pointer; }
+.section-tool-button:hover, .section-tool-button.active { color: #a94735; border-color: #e2a695; background: #f7e4df; }
 .current-color-row { display: grid; grid-template-columns: 40px 1fr 28px; align-items: center; gap: 10px; padding-bottom: 15px; }
 .current-swatch { width: 40px; height: 40px; border-radius: 7px; border: 3px solid white; outline: 1px solid #d2d0c8; box-shadow: 0 2px 7px rgba(39,39,33,.1); }
 .current-color-row > div:nth-child(2) { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
@@ -162,6 +164,14 @@ button { color: inherit; }
 .texture-upload small { font-size: 8px; color: #92948b; }
 .texture-preview { width: 43px; height: 43px; display: grid; place-items: center; border: 1px solid #c9c8c0; border-radius: 6px; background-size: cover; background-position: center; background-color: white; box-shadow: inset 0 0 0 2px rgba(255,255,255,.6); }
 .texture-preview.empty { color: #9a9c94; background-color: #f7f6f1; background-image: linear-gradient(45deg,#e7e6df 25%,transparent 25%),linear-gradient(-45deg,#e7e6df 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#e7e6df 75%),linear-gradient(-45deg,transparent 75%,#e7e6df 75%); background-position: 0 0,0 5px,5px -5px,-5px 0; background-size: 10px 10px; }
+.texture-library-heading { display: flex; justify-content: space-between; margin: 13px 1px 7px; color: #999b92; font: 500 7px/1 'DM Mono',monospace; letter-spacing: .09em; }
+.texture-library-heading strong { color: #777970; }
+.texture-library { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 6px; margin-bottom: 10px; }
+.texture-library-empty { grid-column: 1/-1; padding: 10px; color: #a0a198; text-align: center; font-size: 8px; line-height: 1.4; border: 1px dashed #d1cfc7; border-radius: 7px; }
+.texture-library-item { min-width: 0; padding: 4px; color: #696b64; background: #ecebe5; border: 1px solid #d3d1c9; border-radius: 6px; cursor: pointer; }
+.texture-library-item:hover { border-color: #e1947f; background: #f5e9e4; }
+.texture-library-item img { display: block; width: 100%; aspect-ratio: 1; object-fit: contain; image-rendering: pixelated; background: repeating-conic-gradient(#eee 0 25%,#fff 0 50%) 0/10px 10px; border-radius: 3px; }
+.texture-library-item span { display: block; overflow: hidden; margin-top: 4px; text-overflow: ellipsis; white-space: nowrap; font-size: 7px; }
 .texture-actions { min-height: 25px; display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; color: #979990; font-size: 8px; line-height: 1.4; }
 .texture-actions > div { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: 0 0 auto; }
 .texture-actions button { padding: 0; color: #a94735; border: 0; background: transparent; font-size: 8px; cursor: pointer; }
@@ -230,6 +240,14 @@ kbd { min-width: 17px; display: inline-flex; align-items: center; justify-conten
 .shape-config-modal .eyebrow { display: block; margin: 0 0 8px; }
 .shape-config-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 9px; margin: 0 0 22px; text-align: left; }
 .shape-config-grid label { display: flex; flex-direction: column; gap: 6px; color: #85877f; font-size: 8px; }
+.texture-crop-modal { width: min(620px,calc(100vw - 32px)); padding: 26px; }
+.texture-crop-modal > p { margin-bottom: 14px; }
+.crop-canvas-wrap { display: grid; place-items: center; min-height: 180px; max-height: 390px; margin-bottom: 14px; overflow: auto; background: repeating-conic-gradient(#d9d8d1 0 25%,#efeee8 0 50%) 0/16px 16px; border: 1px solid #c9c7bf; border-radius: 8px; }
+#textureCropCanvas { display: block; max-width: 100%; max-height: 360px; image-rendering: pixelated; cursor: crosshair; touch-action: none; }
+.crop-fields { display: grid; grid-template-columns: repeat(4,1fr); gap: 8px; margin-bottom: 16px; text-align: left; }
+.crop-fields label { display: flex; flex-direction: column; gap: 5px; color: #85877f; font-size: 8px; }
+.crop-fields input { width: 100%; height: 30px; padding: 0 7px; color: #44463f; background: white; border: 1px solid #cfcec6; border-radius: 5px; font: 500 10px/1 'DM Mono',monospace; }
+.crop-actions { flex-wrap: wrap; }
 .height-field { margin: 10px 0 20px; text-align: left; }
 
 @media (max-width: 900px) {

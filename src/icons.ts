@@ -2,6 +2,7 @@ const paths: Record<string, string> = {
   plus: '<path d="M12 5v14M5 12h14"/>',
   trash: '<path d="M3 6h18M8 6V4h8v2m-9 0 1 14h8l1-14M10 10v6m4-6v6"/>',
   brush: '<path d="m14.6 4.3 5.1 5.1M12.8 6.1l5.1 5.1M5 13l8.9-8.9a2.1 2.1 0 0 1 3 0l3 3a2.1 2.1 0 0 1 0 3L11 19H5v-6Z"/>',
+  picker: '<path d="m19 3 2 2-8.5 8.5-2-2L19 3ZM9.5 12.5 5 17v2h2l4.5-4.5M4 21h5"/>',
   undo: '<path d="M9 7 4 12l5 5M5 12h9a5 5 0 0 1 5 5"/>',
   redo: '<path d="m15 7 5 5-5 5m4-5h-9a5 5 0 0 0-5 5"/>',
   save: '<path d="M5 4h12l2 2v14H5V4Zm3 0v6h8V4M8 20v-6h8v6"/>',
