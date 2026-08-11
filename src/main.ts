@@ -1136,17 +1136,24 @@ function selectPrimitive(mesh: Mesh, mode: 'scale' | 'move' = 'scale'): void {
   document.querySelector('#selectedOrigin')!.textContent = `X ${logical.x} · Y ${logical.y} · Z ${logical.z}`;
 }
 
-function getMaterial(hex: string, textureData?: string): StandardMaterial {
+function getMaterial(hex: string, textureData?: string, unlit = false): StandardMaterial {
   const normalized = hex.toLowerCase();
-  const materialKey = `${normalized}|${textureData ?? ''}`;
+  const materialKey = `${normalized}|${textureData ?? ''}|${unlit ? 'unlit' : 'lit'}`;
   const cached = materials.get(materialKey);
   if (cached) return cached;
   const material = new StandardMaterial(`mat-${materials.size}`, scene);
   const base = Color3.FromHexString(normalized);
-  material.diffuseColor = base;
-  material.specularColor = new Color3(0.18, 0.18, 0.18);
-  material.specularPower = 48;
-  material.ambientColor = base.scale(0.22);
+  // A texture already contains its own colours; tinting it with the selected
+  // object colour made images inherit the default orange palette colour.
+  const surfaceColor = textureData ? Color3.White() : base;
+  material.diffuseColor = surfaceColor;
+  material.disableLighting = unlit;
+  if (unlit) material.emissiveColor = surfaceColor;
+  material.specularColor = Color3.Black();
+  // Babylon maps StandardMaterial.specularPower to glTF roughness during export.
+  // Zero produces roughness 1, keeping GLB/glTF models fully matte in other viewers.
+  material.specularPower = 0;
+  material.ambientColor = surfaceColor.scale(0.22);
   if (textureData) {
     const texture = new Texture(textureData, scene, false, false, Texture.NEAREST_SAMPLINGMODE);
     texture.name = `texture-${materials.size}`;
@@ -1337,7 +1344,8 @@ function ensureBoxPaintResources(mesh: Mesh): BoxPaintResources {
     const faceMaterial = new StandardMaterial(`paint-material-${mesh.metadata.id}-${face}`, scene);
     faceMaterial.diffuseColor = Color3.White();
     faceMaterial.ambientColor = new Color3(0.22, 0.22, 0.22);
-    faceMaterial.specularColor = new Color3(0.18, 0.18, 0.18);
+    faceMaterial.specularColor = Color3.Black();
+    faceMaterial.specularPower = 0;
     faceMaterial.diffuseTexture = texture;
     faceMaterial.useAlphaFromDiffuseTexture = true;
     faceMaterial.transparencyMode = Material.MATERIAL_ALPHATEST;
@@ -1421,7 +1429,7 @@ function createPrimitive(data: PrimitiveData): Mesh {
   const sizeY = Math.max(1, Math.round(data.sizeY ?? 1));
   const sizeZ = Math.max(1, Math.round(data.sizeZ ?? 1));
   positionShape(mesh, data.type, logicalPosition, { x: sizeX, y: sizeY, z: sizeZ });
-  mesh.material = getMaterial(data.color, data.texture);
+  mesh.material = getMaterial(data.color, data.texture, data.type === 'billboard');
   mesh.isPickable = true;
   const paintCells = new Map<string, string>();
   data.paint?.forEach((cell) => paintCells.set(`${cell.face}:${cell.u}:${cell.v}`, cell.color.toLowerCase()));
@@ -1728,7 +1736,7 @@ function paintObject(
     if (!mesh.metadata.isVoxel) clearPrimitivePaint(mesh);
     // Kształty bez siatki UV nadal są malowane całym materiałem.
     mesh.metadata.texture = undefined;
-    mesh.material = getMaterial(currentColor);
+    mesh.material = getMaterial(currentColor, undefined, mesh.metadata.kind === 'billboard');
     mesh.metadata.color = currentColor.toLowerCase();
   }
   if (commit) pushHistory();
@@ -1787,7 +1795,7 @@ function textureObject(mesh: Mesh): void {
       height: currentTexturePixelSize.height,
     });
   } else {
-    mesh.material = getMaterial(String(mesh.metadata.color), nextTexture);
+    mesh.material = getMaterial(String(mesh.metadata.color), nextTexture, kind === 'billboard');
   }
   pushHistory();
   showToast(nextTexture ? 'Tekstura dopasowana do siatki — możesz po niej malować' : 'Tekstura została usunięta');
