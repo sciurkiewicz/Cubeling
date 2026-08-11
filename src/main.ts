@@ -13,6 +13,7 @@ import { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { SubMesh } from '@babylonjs/core/Meshes/subMesh';
 import { GizmoManager } from '@babylonjs/core/Gizmos/gizmoManager';
+import { Material } from '@babylonjs/core/Materials/material';
 import { MultiMaterial } from '@babylonjs/core/Materials/multiMaterial';
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial';
 import { DynamicTexture } from '@babylonjs/core/Materials/Textures/dynamicTexture';
@@ -105,6 +106,7 @@ const PALETTE = [
 
 const MAX_HISTORY = 60;
 const MAX_SHAPE_SIZE = 2048;
+const TEXTURE_ALPHA_CUTOFF = 8 / 255;
 const DEFAULT_CANVAS: CanvasSettings = { width: 64, depth: 64, height: 64 };
 let canvasSettings: CanvasSettings = { ...DEFAULT_CANVAS };
 
@@ -232,7 +234,12 @@ app.innerHTML = `
           </div>
           <div class="texture-actions">
             <span id="textureHelp">Po wgraniu kliknij obiekt, aby ją nałożyć.</span>
-            <div><button id="applyTextureAllBtn" hidden>Nałóż na voxele</button><button id="clearTextureBtn" hidden>Usuń</button></div>
+            <div>
+              <button class="stamp-rotate-button" id="rotateStampBtn" type="button" hidden>
+                ${icon('reset', 12)}<span id="stampRotationLabel">Obróć 90° · 0°</span><kbd>Spacja</kbd>
+              </button>
+              <button id="applyTextureAllBtn" hidden>Nałóż na voxele</button><button id="clearTextureBtn" hidden>Usuń</button>
+            </div>
           </div>
           <input id="textureInput" type="file" accept="image/png,image/jpeg,image/webp" hidden />
         </section>
@@ -370,7 +377,7 @@ camera.lowerRadiusLimit = 4;
 camera.upperRadiusLimit = 42;
 camera.minZ = 0.05;
 camera.lowerBetaLimit = 0.18;
-camera.upperBetaLimit = Math.PI / 2.04;
+camera.upperBetaLimit = Math.PI - 0.18;
 // Procentowy krok utrzymuje tę samą szybkość zoomu na canvasie 32 i 256.
 camera.wheelDeltaPercentage = 0.25;
 camera.panningSensibility = 80;
@@ -394,9 +401,14 @@ ground.metadata = { isGround: true };
 const groundMaterial = new StandardMaterial('groundMaterial', scene);
 groundMaterial.diffuseColor = new Color3(0.82, 0.815, 0.78);
 groundMaterial.specularColor = Color3.Black();
-groundMaterial.alpha = 0.98;
+// The work surface is visually opaque and must participate in the depth buffer.
+// Treating it as transparent makes it sort against textured model faces by mesh
+// centre, which can cover otherwise visible walls at some camera angles.
+groundMaterial.alpha = 1;
 ground.material = groundMaterial;
 groundMaterial.freeze();
+
+let viewingFromBelow = false;
 
 function getCanvasBounds(settings = canvasSettings): { minX: number; maxX: number; minZ: number; maxZ: number } {
   const minX = -Math.floor(settings.width / 2);
@@ -431,8 +443,24 @@ function createGrid(): void {
   }
   gridMesh = MeshBuilder.CreateLineSystem('grid-lines', { lines, colors, updatable: false }, scene);
   gridMesh.isPickable = false;
+  gridMesh.setEnabled(!viewingFromBelow);
   gridMesh.freezeWorldMatrix();
 }
+
+function updateWorkSurfaceVisibility(): void {
+  // Ground leży tuż pod dolnymi ścianami modeli. Od spodu był pierwszym
+  // trafieniem pickera i blokował malowanie, mimo że jego materiał był od tyłu
+  // niewidoczny. Histereza zapobiega miganiu dokładnie na poziomie siatki.
+  const shouldHide = viewingFromBelow
+    ? camera.position.y < -0.47
+    : camera.position.y < -0.53;
+  if (shouldHide === viewingFromBelow) return;
+  viewingFromBelow = shouldHide;
+  ground.setEnabled(!viewingFromBelow);
+  gridMesh?.setEnabled(!viewingFromBelow);
+}
+
+scene.onBeforeRenderObservable.add(updateWorkSurfaceVisibility);
 
 function applyCanvasVisuals(frame = false): void {
   const { minX, maxX, minZ, maxZ } = getCanvasBounds();
@@ -477,6 +505,7 @@ let currentTexturePixels: Uint8ClampedArray | null = null;
 let currentTexturePixelSize = { width: 0, height: 0 };
 let texturePlacementPending = false;
 let textureStampPending = false;
+let stampRotation = 0;
 const textureLibrary = new Map<string, TextureLibraryItem>();
 let hoveredMesh: Mesh | null = null;
 let hoveredTool: Tool | null = null;
@@ -635,9 +664,32 @@ let stampBoxPreviewResources: StampBoxPreviewResources | null = null;
 let stampBoxPreviewFace = -1;
 let stampBoxPreviewKey = '';
 
+function getStampPixelSize(): { width: number; height: number } {
+  return stampRotation % 2 === 0
+    ? { ...currentTexturePixelSize }
+    : { width: currentTexturePixelSize.height, height: currentTexturePixelSize.width };
+}
+
+function stampSourceOffsetAt(x: number, y: number): number {
+  const { width, height } = currentTexturePixelSize;
+  let sourceX = x;
+  let sourceY = y;
+  if (stampRotation === 1) {
+    sourceX = y;
+    sourceY = height - 1 - x;
+  } else if (stampRotation === 2) {
+    sourceX = width - 1 - x;
+    sourceY = height - 1 - y;
+  } else if (stampRotation === 3) {
+    sourceX = width - 1 - y;
+    sourceY = x;
+  }
+  return (sourceY * width + sourceX) * 4;
+}
+
 function stampPixelColorAt(x: number, y: number): string | null {
   if (!currentTexturePixels) return null;
-  const offset = (y * currentTexturePixelSize.width + x) * 4;
+  const offset = stampSourceOffsetAt(x, y);
   if (currentTexturePixels[offset + 3] < 8) return null;
   return `#${[currentTexturePixels[offset], currentTexturePixels[offset + 1], currentTexturePixels[offset + 2]]
     .map((value) => value.toString(16).padStart(2, '0')).join('')}`;
@@ -726,7 +778,8 @@ function updateBoxStampPreview(
   stampBoxPreview.scaling.copyFrom(mesh.scaling).scaleInPlace(1.001);
   stampBoxPreview.setEnabled(true);
 
-  const previewKey = `${resources.signature}:${surfaceCell.face}:${surfaceCell.u}:${surfaceCell.v}`;
+  const stampSize = getStampPixelSize();
+  const previewKey = `${resources.signature}:${surfaceCell.face}:${surfaceCell.u}:${surfaceCell.v}:${stampRotation}`;
   if (previewKey === stampBoxPreviewKey) return true;
   if (stampBoxPreviewFace !== surfaceCell.face) clearStampBoxPreviewFace(resources, stampBoxPreviewFace);
   const texture = resources.textures[surfaceCell.face];
@@ -734,10 +787,10 @@ function updateBoxStampPreview(
   const textureSize = texture.getSize();
   const faceSize = boxFaceGridSize(mesh, surfaceCell.face);
   context.clearRect(0, 0, textureSize.width, textureSize.height);
-  const startU = surfaceCell.u - Math.floor(currentTexturePixelSize.width / 2);
-  const startV = surfaceCell.v - Math.floor(currentTexturePixelSize.height / 2);
-  for (let y = 0; y < currentTexturePixelSize.height; y += 1) {
-    for (let x = 0; x < currentTexturePixelSize.width; x += 1) {
+  const startU = surfaceCell.u - Math.floor(stampSize.width / 2);
+  const startV = surfaceCell.v - Math.floor(stampSize.height / 2);
+  for (let y = 0; y < stampSize.height; y += 1) {
+    for (let x = 0; x < stampSize.width; x += 1) {
       const u = startU + x;
       const v = startV + y;
       if (u < 0 || v < 0 || u >= faceSize.width || v >= faceSize.height) continue;
@@ -762,21 +815,30 @@ function refreshStampPreviewTexture(): void {
   stampPreviewTexture = null;
   hideStampPreviews();
   stampBoxPreviewKey = '';
+  const rotateButton = document.querySelector('#rotateStampBtn') as HTMLButtonElement;
+  rotateButton.hidden = !textureStampPending;
+  document.querySelector('#stampRotationLabel')!.textContent = `Obróć 90° · ${stampRotation * 90}°`;
+  rotateButton.setAttribute('aria-label', `Obróć stempel o 90 stopni. Aktualny obrót: ${stampRotation * 90} stopni`);
   if (!textureStampPending || !currentTexturePixels || !currentTexturePixelSize.width) return;
+  const stampSize = getStampPixelSize();
   const texture = new DynamicTexture(
     'stamp-preview-texture',
-    { width: currentTexturePixelSize.width, height: currentTexturePixelSize.height },
+    stampSize,
     scene,
     false,
     Texture.NEAREST_SAMPLINGMODE,
   );
   const context = texture.getContext();
-  const image = new ImageData(currentTexturePixelSize.width, currentTexturePixelSize.height);
-  for (let index = 0; index < currentTexturePixels.length; index += 4) {
-    image.data[index] = currentTexturePixels[index];
-    image.data[index + 1] = currentTexturePixels[index + 1];
-    image.data[index + 2] = currentTexturePixels[index + 2];
-    image.data[index + 3] = currentTexturePixels[index + 3] < 8 ? 0 : 255;
+  const image = new ImageData(stampSize.width, stampSize.height);
+  for (let y = 0; y < stampSize.height; y += 1) {
+    for (let x = 0; x < stampSize.width; x += 1) {
+      const targetOffset = (y * stampSize.width + x) * 4;
+      const sourceOffset = stampSourceOffsetAt(x, y);
+      image.data[targetOffset] = currentTexturePixels[sourceOffset];
+      image.data[targetOffset + 1] = currentTexturePixels[sourceOffset + 1];
+      image.data[targetOffset + 2] = currentTexturePixels[sourceOffset + 2];
+      image.data[targetOffset + 3] = currentTexturePixels[sourceOffset + 3] < 8 ? 0 : 255;
+    }
   }
   context.putImageData(image, 0, 0);
   texture.update(true);
@@ -786,6 +848,25 @@ function refreshStampPreviewTexture(): void {
   stampPreviewTexture = texture;
   stampPreviewMaterial.diffuseTexture = stampPreviewTexture;
   stampPreviewMaterial.opacityTexture = stampPreviewTexture;
+}
+
+function rotateStamp(): void {
+  if (!textureStampPending || !currentTexturePixels) return;
+  stampRotation = (stampRotation + 1) % 4;
+  refreshStampPreviewTexture();
+  const pick = scene.pick(
+    scene.pointerX,
+    scene.pointerY,
+    (candidate) => Boolean(candidate.metadata?.isModel),
+  );
+  if (pick?.hit && pick.pickedMesh) {
+    updateStampPreview(
+      pick.pickedMesh as Mesh,
+      pick.getNormal(true),
+      pick.getTextureCoordinates(),
+    );
+  }
+  showToast(`Obrót stempla: ${stampRotation * 90}°`);
 }
 
 function updateStampPreview(
@@ -804,16 +885,17 @@ function updateStampPreview(
   stampBoxPreview.setEnabled(false);
   if (!mesh.metadata.isVoxel) return;
   const logical = getLogicalPosition(mesh);
-  const startX = logical.x - Math.floor(currentTexturePixelSize.width / 2);
-  const startZ = logical.z - Math.floor(currentTexturePixelSize.height / 2);
+  const stampSize = getStampPixelSize();
+  const startX = logical.x - Math.floor(stampSize.width / 2);
+  const startZ = logical.z - Math.floor(stampSize.height / 2);
   const point = new Vector3(
-    startX + (currentTexturePixelSize.width - 1) / 2,
+    startX + (stampSize.width - 1) / 2,
     logical.y + 0.501,
-    startZ + (currentTexturePixelSize.height - 1) / 2,
+    startZ + (stampSize.height - 1) / 2,
   );
   stampPreview.rotation.set(0, 0, 0);
   stampPreview.rotation.x = Math.PI / 2;
-  stampPreview.scaling.set(currentTexturePixelSize.width, currentTexturePixelSize.height, 1);
+  stampPreview.scaling.set(stampSize.width, stampSize.height, 1);
   stampPreview.position.copyFrom(point);
   stampPreview.setEnabled(true);
 }
@@ -830,6 +912,7 @@ const positionGizmo = gizmoManager.gizmos.positionGizmo!;
 scaleGizmo.updateGizmoRotationToMatchAttachedMesh = false;
 scaleGizmo.uniformScaleGizmo.isEnabled = false;
 scaleGizmo.sensitivity = 0.85;
+scaleGizmo.incrementalSnap = true;
 positionGizmo.updateGizmoRotationToMatchAttachedMesh = false;
 positionGizmo.planarGizmoEnabled = false;
 positionGizmo.snapDistance = 1;
@@ -850,16 +933,16 @@ function sizeFromMeshScale(mesh: Mesh): { x: number; y: number; z: number } {
     y: Number(mesh.metadata.sizeY ?? 1),
     z: Number(mesh.metadata.sizeZ ?? 1),
   };
-  const absolute = {
-    x: Math.abs(mesh.scaling.x),
-    y: Math.abs(mesh.scaling.y),
-    z: Math.abs(mesh.scaling.z),
+  const positive = {
+    x: Math.max(0, mesh.scaling.x),
+    y: Math.max(0, mesh.scaling.y),
+    z: Math.max(0, mesh.scaling.z),
   };
-  if (kind === 'box' || kind === 'square') return absolute;
-  if (kind === 'pyramid') return { x: absolute.x * 1.38, y: absolute.y * 1.5, z: absolute.z * 1.38 };
-  if (kind === 'circle') return { x: absolute.x * 1.44, y: absolute.y * 1.44, z: current.z };
-  if (kind === 'plane') return { x: absolute.x * 1.65, y: current.y, z: absolute.z * 1.65 };
-  return { x: absolute.x * 1.5, y: absolute.y * 1.5, z: current.z };
+  if (kind === 'box' || kind === 'square') return positive;
+  if (kind === 'pyramid') return { x: positive.x * 1.38, y: positive.y * 1.5, z: positive.z * 1.38 };
+  if (kind === 'circle') return { x: positive.x * 1.44, y: positive.y * 1.44, z: current.z };
+  if (kind === 'plane') return { x: positive.x * 1.65, y: current.y, z: positive.z * 1.65 };
+  return { x: positive.x * 1.5, y: positive.y * 1.5, z: current.z };
 }
 
 function normalizeShapeSize(requested: { x: number; y: number; z: number }): { x: number; y: number; z: number } {
@@ -875,6 +958,28 @@ function configureScaleAxes(mesh: Mesh): void {
   scaleGizmo.xGizmo.isEnabled = true;
   scaleGizmo.yGizmo.isEnabled = kind !== 'plane';
   scaleGizmo.zGizmo.isEnabled = kind === 'box' || kind === 'square' || kind === 'pyramid' || kind === 'plane';
+  const snap = kind === 'pyramid'
+    ? { x: 1 / 1.38, y: 1 / 1.5, z: 1 / 1.38 }
+    : kind === 'circle'
+      ? { x: 1 / 1.44, y: 1 / 1.44, z: 1 }
+      : kind === 'plane'
+        ? { x: 1 / 1.65, y: 1, z: 1 / 1.65 }
+        : kind === 'billboard'
+          ? { x: 1 / 1.5, y: 1 / 1.5, z: 1 }
+          : { x: 1, y: 1, z: 1 };
+  scaleGizmo.xGizmo.snapDistance = snap.x;
+  scaleGizmo.yGizmo.snapDistance = snap.y;
+  scaleGizmo.zGizmo.snapDistance = snap.z;
+  // AxisScaleGizmo mierzy próg snapa jako względną zmianę skali. Bez
+  // kompensacji obiekt 40× potrzebował około 40 razy dłuższego ruchu myszy niż
+  // obiekt 1×, zanim wykonał pierwszy krok. Czułość zależna od aktualnej skali
+  // daje podobny ekranowy dystans dla zmiany o jedną komórkę na każdej osi;
+  // dolny i górny limit usuwają martwą strefę bez nadwrażliwości wielkich brył.
+  const baseSensitivity = 0.85;
+  const axisSensitivity = (scale: number) => baseSensitivity * Math.min(64, Math.max(8, Math.abs(scale)));
+  scaleGizmo.xGizmo.sensitivity = axisSensitivity(mesh.scaling.x);
+  scaleGizmo.yGizmo.sensitivity = axisSensitivity(mesh.scaling.y);
+  scaleGizmo.zGizmo.sensitivity = axisSensitivity(mesh.scaling.z);
 }
 
 scaleGizmo.onDragStartObservable.add(() => {
@@ -886,6 +991,30 @@ scaleGizmo.onDragStartObservable.add(() => {
     y: Number(mesh.metadata.sizeY ?? 1),
     z: Number(mesh.metadata.sizeZ ?? 1),
   };
+});
+
+scaleGizmo.onDragObservable.add(() => {
+  const mesh = scaleGizmo.attachedMesh as Mesh | null;
+  if (!mesh?.metadata?.isModel || mesh.metadata.isVoxel || !scaleStartSize) return;
+  const next = normalizeShapeSize(sizeFromMeshScale(mesh));
+  // Nie nadpisujemy transformacji pomiędzy progami snapa — gizmo potrzebuje
+  // tych zdarzeń, żeby uzbierać dystans do następnego kroku. Kotwiczenie jest
+  // wykonywane dopiero przy faktycznej zmianie rozmiaru o jedną komórkę.
+  if (next.x === mesh.metadata.sizeX && next.y === mesh.metadata.sizeY && next.z === mesh.metadata.sizeZ) return;
+  mesh.metadata.sizeX = next.x;
+  mesh.metadata.sizeY = next.y;
+  mesh.metadata.sizeZ = next.z;
+  positionShape(mesh, mesh.metadata.kind as ShapeType, getLogicalPosition(mesh), next);
+  const logical = getLogicalPosition(mesh);
+  selectionBox.scaling.set(next.x + 0.06, Math.max(0.08, next.y + 0.06), next.z + 0.06);
+  selectionBox.position.set(
+    logical.x + (next.x - 1) / 2,
+    logical.y - 0.5 + Math.max(0.04, next.y / 2),
+    logical.z + (next.z - 1) / 2,
+  );
+  (document.querySelector('#selectedSizeX') as HTMLInputElement).value = String(next.x);
+  (document.querySelector('#selectedSizeY') as HTMLInputElement).value = String(next.y);
+  (document.querySelector('#selectedSizeZ') as HTMLInputElement).value = String(next.z);
 });
 
 scaleGizmo.onDragEndObservable.add(() => {
@@ -1024,6 +1153,14 @@ function getMaterial(hex: string, textureData?: string): StandardMaterial {
     texture.hasAlpha = textureData.startsWith('data:image/png') || textureData.startsWith('data:image/webp');
     material.diffuseTexture = texture;
     material.useAlphaFromDiffuseTexture = texture.hasAlpha;
+    if (texture.hasAlpha) {
+      // Textured model surfaces are solid geometry. Alpha blending moves them to
+      // Babylon's distance-sorted transparent queue, where intersecting/large
+      // boxes can be drawn in the wrong order as the camera rotates. Alpha test
+      // preserves cut-out pixels while keeping normal depth writes and occlusion.
+      material.transparencyMode = Material.MATERIAL_ALPHATEST;
+      material.alphaCutOff = TEXTURE_ALPHA_CUTOFF;
+    }
   }
   material.freeze();
   materials.set(materialKey, material);
@@ -1203,6 +1340,8 @@ function ensureBoxPaintResources(mesh: Mesh): BoxPaintResources {
     faceMaterial.specularColor = new Color3(0.18, 0.18, 0.18);
     faceMaterial.diffuseTexture = texture;
     faceMaterial.useAlphaFromDiffuseTexture = true;
+    faceMaterial.transparencyMode = Material.MATERIAL_ALPHATEST;
+    faceMaterial.alphaCutOff = TEXTURE_ALPHA_CUTOFF;
     multiMaterial.subMaterials.push(faceMaterial);
     textures.push(texture);
     faceMaterials.push(faceMaterial);
@@ -1664,12 +1803,13 @@ function stampTextureOnObject(
   let changed = 0;
   if (surfaceCell) {
     const faceSize = boxFaceGridSize(mesh, surfaceCell.face);
-    const startU = surfaceCell.u - Math.floor(currentTexturePixelSize.width / 2);
-    const startV = surfaceCell.v - Math.floor(currentTexturePixelSize.height / 2);
+    const stampSize = getStampPixelSize();
+    const startU = surfaceCell.u - Math.floor(stampSize.width / 2);
+    const startV = surfaceCell.v - Math.floor(stampSize.height / 2);
     const cells = getPaintCells(mesh);
     ensureBoxPaintResources(mesh);
-    for (let y = 0; y < currentTexturePixelSize.height; y += 1) {
-      for (let x = 0; x < currentTexturePixelSize.width; x += 1) {
+    for (let y = 0; y < stampSize.height; y += 1) {
+      for (let x = 0; x < stampSize.width; x += 1) {
         const u = startU + x;
         const v = startV + y;
         if (u < 0 || v < 0 || u >= faceSize.width || v >= faceSize.height) continue;
@@ -1685,10 +1825,11 @@ function stampTextureOnObject(
     if (changed) schedulePaintTextureUpdate(mesh, surfaceCell.face);
   } else if (mesh.metadata.isVoxel) {
     const anchor = getLogicalPosition(mesh);
-    const startX = anchor.x - Math.floor(currentTexturePixelSize.width / 2);
-    const startZ = anchor.z - Math.floor(currentTexturePixelSize.height / 2);
-    for (let y = 0; y < currentTexturePixelSize.height; y += 1) {
-      for (let x = 0; x < currentTexturePixelSize.width; x += 1) {
+    const stampSize = getStampPixelSize();
+    const startX = anchor.x - Math.floor(stampSize.width / 2);
+    const startZ = anchor.z - Math.floor(stampSize.height / 2);
+    for (let y = 0; y < stampSize.height; y += 1) {
+      for (let x = 0; x < stampSize.width; x += 1) {
         const voxel = voxels.get(keyOf(startX + x, anchor.y, startZ + y));
         const color = stampPixelColorAt(x, y);
         if (!voxel || !color || voxel.metadata.color === color) continue;
@@ -2283,6 +2424,7 @@ async function useTextureCrop(mode: 'base' | 'stamp'): Promise<void> {
   const data = output.toDataURL('image/png');
   texturePlacementPending = mode === 'base';
   textureStampPending = mode === 'stamp';
+  stampRotation = 0;
   setCurrentTexture(data, `${item.name} · wycinek ${output.width}×${output.height}`, pixels, { width: output.width, height: output.height });
   closeTextureCrop();
   setTool('paint');
@@ -2339,6 +2481,7 @@ async function processTextureFile(file: File): Promise<void> {
 document.querySelector('#uploadTextureBtn')!.addEventListener('click', () => {
   (document.querySelector('#textureInput') as HTMLInputElement).click();
 });
+document.querySelector('#rotateStampBtn')!.addEventListener('click', rotateStamp);
 document.querySelector('#textureInput')!.addEventListener('change', (event) => {
   const input = event.target as HTMLInputElement;
   if (input.files?.[0]) void processTextureFile(input.files[0]);
@@ -2693,6 +2836,7 @@ window.addEventListener('beforeunload', (event) => {
 
 window.addEventListener('keydown', (event) => {
   const isTyping = document.activeElement instanceof HTMLInputElement;
+  const isButtonFocused = document.activeElement instanceof HTMLButtonElement;
   if (event.key === 'Escape') {
     shapePopover.hidden = true;
     shapeSizeModal.hidden = true;
@@ -2725,6 +2869,12 @@ window.addEventListener('keydown', (event) => {
     return;
   }
   if (isTyping) return;
+  const modalOpen = !shapeSizeModal.hidden || !textureCropModal.hidden || !modal.hidden || !setupModal.hidden;
+  if (!isButtonFocused && !modalOpen && event.code === 'Space' && textureStampPending) {
+    event.preventDefault();
+    if (!event.repeat) rotateStamp();
+    return;
+  }
   const key = event.key.toLowerCase();
   if (key === 'v') setTool('select');
   if (key === 'b') setTool('add');

@@ -177,6 +177,9 @@ button { color: inherit; }
 .texture-actions button { padding: 0; color: #a94735; border: 0; background: transparent; font-size: 8px; cursor: pointer; }
 .texture-actions button:hover { text-decoration: underline; }
 .texture-actions button[hidden] { display: none; }
+.texture-actions .stamp-rotate-button { display: flex; align-items: center; gap: 4px; padding: 5px 7px; color: #5d5f58; background: #ecebe5; border: 1px solid #d2d0c8; border-radius: 5px; white-space: nowrap; }
+.texture-actions .stamp-rotate-button:hover { color: #a94735; background: #f7e4df; border-color: #e2a695; text-decoration: none; }
+.stamp-rotate-button kbd { padding: 2px 4px; color: #898b83; background: #f8f7f2; border: 1px solid #d5d3cb; border-bottom-width: 2px; border-radius: 3px; font: 500 6px/1 'DM Mono', monospace; }
 
 .model-card { display: grid; grid-template-columns: 38px 1fr 8px; align-items: center; gap: 10px; padding: 10px; margin-bottom: 10px; background: #ebeae4; border: 1px solid #dad9d2; border-radius: 7px; }
 .model-icon { width: 36px; height: 36px; display: grid; place-items: center; color: #7d7f77; background: #f6f5f0; border: 1px solid #d6d5ce; border-radius: 6px; }
