@@ -28,7 +28,8 @@ import { STLExport } from '@babylonjs/serializers/stl/stlSerializer';
 import { icon } from './icons';
 
 type Tool = 'select' | 'add' | 'erase' | 'paint' | 'eyedropper' | 'texture' | 'shape';
-type ShapeType = 'box' | 'pyramid' | 'circle' | 'square' | 'plane' | 'billboard';
+type ShapeType = 'box' | 'pyramid' | 'circle' | 'sphere' | 'cylinder' | 'square' | 'plane' | 'billboard';
+type VoxelShapeType = 'pyramid' | 'sphere' | 'cylinder';
 type ExportFormat = 'glb' | 'gltf' | 'obj' | 'stl' | 'json';
 
 interface VoxelData {
@@ -106,6 +107,7 @@ const PALETTE = [
 
 const MAX_HISTORY = 60;
 const MAX_SHAPE_SIZE = 2048;
+const MAX_VOXEL_SHAPE_VOXELS = 12000;
 const TEXTURE_ALPHA_CUTOFF = 8 / 255;
 const DEFAULT_CANVAS: CanvasSettings = { width: 64, depth: 64, height: 64 };
 let canvasSettings: CanvasSettings = { ...DEFAULT_CANVAS };
@@ -181,7 +183,8 @@ app.innerHTML = `
           <div class="shape-grid">
             <button data-shape="box">${icon('cube', 21)}<span>Box</span></button>
             <button data-shape="pyramid">${icon('pyramid', 21)}<span>Piramida</span></button>
-            <button data-shape="circle">${icon('circle', 21)}<span>Koło</span></button>
+            <button data-shape="sphere">${icon('circle', 21)}<span>Kula</span></button>
+            <button data-shape="cylinder">${icon('cylinder', 21)}<span>Cylinder</span></button>
             <button data-shape="plane">${icon('plane', 21)}<span>Plane</span></button>
             <button data-shape="billboard">${icon('billboard', 21)}<span>Billboard</span></button>
           </div>
@@ -331,7 +334,7 @@ app.innerHTML = `
         <div class="setup-mark">${icon('cube', 25)}</div>
         <span class="eyebrow">NOWY KSZTAŁT</span>
         <h2 id="shapeSizeTitle">Rozmiar Boxa</h2>
-        <p>Podaj wymiary w komórkach siatki. Po zatwierdzeniu kliknij miejsce, w którym ma powstać obiekt.</p>
+        <p id="shapeSizeDescription">Podaj wymiary w komórkach siatki. Po zatwierdzeniu kliknij miejsce, w którym ma powstać obiekt.</p>
         <div class="shape-config-grid">
           <label><span>Szerokość X</span><input id="modalShapeSizeX" type="number" min="1" max="2048" value="1" /></label>
           <label><span>Wysokość Y</span><input id="modalShapeSizeY" type="number" min="1" max="2048" value="1" /></label>
@@ -554,6 +557,11 @@ function createShapeSource(type: 'voxel' | ShapeType): Mesh {
     source.rotation.y = Math.PI / 4;
   } else if (type === 'circle') {
     source = MeshBuilder.CreateDisc(`source-${type}`, { radius: 0.72, tessellation: 32, sideOrientation: Mesh.DOUBLESIDE }, scene);
+    source.rotation.x = Math.PI / 2;
+  } else if (type === 'sphere') {
+    source = MeshBuilder.CreateSphere(`source-${type}`, { diameter: 1, segments: 24 }, scene);
+  } else if (type === 'cylinder') {
+    source = MeshBuilder.CreateCylinder(`source-${type}`, { height: 1, diameter: 1, tessellation: 32 }, scene);
   } else if (type === 'box' || type === 'square') {
     // `square` zostaje tylko jako migracja projektów zapisanych w poprzedniej wersji.
     source = MeshBuilder.CreateBox(`source-${type}`, { size: 1 }, scene);
@@ -593,7 +601,13 @@ function positionShape(
     mesh.scaling.set(size.x / 1.38, size.y / 1.5, size.z / 1.38);
     mesh.position.set(centerX, logicalPosition.y - 0.5 + size.y / 2, centerZ);
   } else if (type === 'circle') {
-    mesh.scaling.set(size.x / 1.44, size.y / 1.44, Math.max(1, size.z));
+    mesh.scaling.set(size.x / 1.44, size.z / 1.44, 1);
+    mesh.position.set(centerX, logicalPosition.y, centerZ);
+  } else if (type === 'sphere') {
+    mesh.scaling.set(size.x, size.y, size.z);
+    mesh.position.set(centerX, logicalPosition.y - 0.5 + size.y / 2, centerZ);
+  } else if (type === 'cylinder') {
+    mesh.scaling.set(size.x, size.y, size.z);
     mesh.position.set(centerX, logicalPosition.y - 0.5 + size.y / 2, centerZ);
   } else if (type === 'box' || type === 'square') {
     mesh.scaling.set(size.x, size.y, size.z);
@@ -940,7 +954,9 @@ function sizeFromMeshScale(mesh: Mesh): { x: number; y: number; z: number } {
   };
   if (kind === 'box' || kind === 'square') return positive;
   if (kind === 'pyramid') return { x: positive.x * 1.38, y: positive.y * 1.5, z: positive.z * 1.38 };
-  if (kind === 'circle') return { x: positive.x * 1.44, y: positive.y * 1.44, z: current.z };
+  if (kind === 'circle') return { x: positive.x * 1.44, y: current.y, z: positive.y * 1.44 };
+  if (kind === 'sphere') return positive;
+  if (kind === 'cylinder') return positive;
   if (kind === 'plane') return { x: positive.x * 1.65, y: current.y, z: positive.z * 1.65 };
   return { x: positive.x * 1.5, y: positive.y * 1.5, z: current.z };
 }
@@ -956,12 +972,12 @@ function normalizeShapeSize(requested: { x: number; y: number; z: number }): { x
 function configureScaleAxes(mesh: Mesh): void {
   const kind = mesh.metadata.kind as ShapeType;
   scaleGizmo.xGizmo.isEnabled = true;
-  scaleGizmo.yGizmo.isEnabled = kind !== 'plane';
-  scaleGizmo.zGizmo.isEnabled = kind === 'box' || kind === 'square' || kind === 'pyramid' || kind === 'plane';
+  scaleGizmo.yGizmo.isEnabled = kind !== 'plane' && kind !== 'circle';
+  scaleGizmo.zGizmo.isEnabled = kind === 'box' || kind === 'square' || kind === 'pyramid' || kind === 'circle' || kind === 'sphere' || kind === 'cylinder' || kind === 'plane';
   const snap = kind === 'pyramid'
     ? { x: 1 / 1.38, y: 1 / 1.5, z: 1 / 1.38 }
     : kind === 'circle'
-      ? { x: 1 / 1.44, y: 1 / 1.44, z: 1 }
+      ? { x: 1 / 1.44, y: 1, z: 1 / 1.44 }
       : kind === 'plane'
         ? { x: 1 / 1.65, y: 1, z: 1 / 1.65 }
         : kind === 'billboard'
@@ -1093,6 +1109,8 @@ const shapeNames: Record<ShapeType, string> = {
   box: 'Box',
   pyramid: 'Piramida',
   circle: 'Koło',
+  sphere: 'Kula',
+  cylinder: 'Cylinder',
   square: 'Box',
   plane: 'Plane',
   billboard: 'Billboard',
@@ -1630,8 +1648,92 @@ function addVoxel(position: Vector3, commit = true): boolean {
   return true;
 }
 
-function addPrimitive(position: Vector3): void {
+function isVoxelShape(type: ShapeType): type is VoxelShapeType {
+  return type === 'pyramid' || type === 'sphere' || type === 'cylinder';
+}
+
+function ellipseAxisDistance(index: number, size: number): number {
+  if (size <= 1) return 0;
+  const center = (size - 1) / 2;
+  // Half-cell inset keeps small even and odd diameters circular instead of
+  // turning 3x3/6x6 footprints into almost solid squares.
+  const radius = size === 2 ? 1 : (size - 0.5) / 2;
+  return ((index - center) / radius) ** 2;
+}
+
+function generateVoxelShapeOffsets(type: VoxelShapeType, size: { x: number; y: number; z: number }): Vector3[] | null {
+  const boundingVolume = size.x * size.y * size.z;
+  if (!Number.isSafeInteger(boundingVolume) || boundingVolume > MAX_VOXEL_SHAPE_VOXELS * 4) return null;
+  const offsets: Vector3[] = [];
+  const append = (x: number, y: number, z: number): boolean => {
+    if (offsets.length >= MAX_VOXEL_SHAPE_VOXELS) return false;
+    offsets.push(new Vector3(x, y, z));
+    return true;
+  };
+
+  if (type === 'pyramid') {
+    const maxInsetX = Math.floor((size.x - 1) / 2);
+    const maxInsetZ = Math.floor((size.z - 1) / 2);
+    for (let y = 0; y < size.y; y += 1) {
+      const progress = size.y === 1 ? 0 : y / (size.y - 1);
+      const insetX = Math.round(progress * maxInsetX);
+      const insetZ = Math.round(progress * maxInsetZ);
+      for (let z = insetZ; z < size.z - insetZ; z += 1) {
+        for (let x = insetX; x < size.x - insetX; x += 1) {
+          if (!append(x, y, z)) return null;
+        }
+      }
+    }
+  } else if (type === 'sphere') {
+    for (let z = 0; z < size.z; z += 1) {
+      for (let y = 0; y < size.y; y += 1) {
+        for (let x = 0; x < size.x; x += 1) {
+          const distance = ellipseAxisDistance(x, size.x)
+            + ellipseAxisDistance(y, size.y)
+            + ellipseAxisDistance(z, size.z);
+          if (distance <= 1 && !append(x, y, z)) return null;
+        }
+      }
+    }
+  } else {
+    for (let y = 0; y < size.y; y += 1) {
+      for (let z = 0; z < size.z; z += 1) {
+        for (let x = 0; x < size.x; x += 1) {
+          if (ellipseAxisDistance(x, size.x) + ellipseAxisDistance(z, size.z) <= 1 && !append(x, y, z)) return null;
+        }
+      }
+    }
+  }
+  return offsets;
+}
+
+function addShape(position: Vector3): void {
   const logical = new Vector3(Math.round(position.x), Math.max(0, Math.round(position.y)), Math.round(position.z));
+  if (isVoxelShape(currentShape)) {
+    const offsets = generateVoxelShapeOffsets(currentShape, currentShapeSize);
+    if (!offsets) {
+      showToast(`Kształt przekracza limit ${MAX_VOXEL_SHAPE_VOXELS} voxeli`, true);
+      return;
+    }
+    const positions = offsets.map((offset) => logical.add(offset));
+    if (positions.some(isPositionOccupied)) {
+      showToast('Kształt nachodzi na istniejący model', true);
+      return;
+    }
+    positions.forEach((voxelPosition) => {
+      const pixelColor = currentTexturePixels ? sampleTextureColor(voxelPosition) : null;
+      createVoxel({
+        x: voxelPosition.x,
+        y: voxelPosition.y,
+        z: voxelPosition.z,
+        color: pixelColor ?? currentColor,
+      });
+    });
+    pushHistory();
+    updateStats();
+    showToast(`${shapeNames[currentShape]}: dodano ${positions.length} voxeli 1 × 1 × 1`);
+    return;
+  }
   if (isPositionOccupied(logical)) return;
   createPrimitive({
     id: crypto.randomUUID(),
@@ -1965,7 +2067,7 @@ scene.onPointerObservable.add((pointerInfo) => {
     } else if (currentTool === 'add') {
       addVoxel(getSnappedEditPosition(mesh, point, normal));
     } else if (currentTool === 'shape') {
-      addPrimitive(getSnappedEditPosition(mesh, point, normal));
+      addShape(getSnappedEditPosition(mesh, point, normal));
     } else if (mesh.metadata?.isModel && currentTool === 'erase') {
       eraseObject(mesh);
     } else if (mesh.metadata?.isModel && currentTool === 'eyedropper') {
@@ -2111,9 +2213,17 @@ document.querySelectorAll<HTMLButtonElement>('[data-shape]').forEach((button) =>
     currentShape = button.dataset.shape as ShapeType;
     document.querySelectorAll<HTMLButtonElement>('[data-shape]').forEach((item) => item.classList.toggle('selected', item === button));
     shapeSizeInputs.x.value = String(currentShapeSize.x);
-    shapeSizeInputs.y.value = String(currentShapeSize.y);
+    shapeSizeInputs.y.value = String(currentShape === 'circle' ? 1 : currentShapeSize.y);
     shapeSizeInputs.z.value = String(currentShapeSize.z);
+    shapeSizeInputs.y.disabled = currentShape === 'circle';
     document.querySelector('#shapeSizeTitle')!.textContent = `Rozmiar: ${shapeNames[currentShape]}`;
+    document.querySelector('#shapeSizeDescription')!.textContent = currentShape === 'sphere'
+      ? 'Kula zostanie wypełniona osobnymi voxelami 1 × 1 × 1. Równe wymiary X/Y/Z dadzą kulę, a różne — ellipsoidę.'
+      : currentShape === 'circle'
+        ? 'Koło powstanie jako jedna pozioma warstwa osobnych voxeli na płaszczyźnie X/Z.'
+      : isVoxelShape(currentShape)
+        ? 'Kształt zostanie wygenerowany z osobnych voxeli 1 × 1 × 1, które możesz później niezależnie edytować.'
+        : 'Podaj wymiary w komórkach siatki. Po zatwierdzeniu kliknij miejsce, w którym ma powstać obiekt.';
     shapePopover.hidden = true;
     shapeSizeModal.hidden = false;
     shapeSizeInputs.x.focus();
@@ -2133,7 +2243,7 @@ document.querySelector('#cancelShapeSize')!.addEventListener('click', () => {
 document.querySelector('#applyShapeSize')!.addEventListener('click', () => {
   currentShapeSize = {
     x: readSizeInput(shapeSizeInputs.x, MAX_SHAPE_SIZE),
-    y: readSizeInput(shapeSizeInputs.y, MAX_SHAPE_SIZE),
+    y: currentShape === 'circle' ? 1 : readSizeInput(shapeSizeInputs.y, MAX_SHAPE_SIZE),
     z: readSizeInput(shapeSizeInputs.z, MAX_SHAPE_SIZE),
   };
   shapeSizeModal.hidden = true;
