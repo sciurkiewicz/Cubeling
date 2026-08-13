@@ -1,6 +1,7 @@
 import './style.css';
 import { ArcRotateCamera } from '@babylonjs/core/Cameras/arcRotateCamera';
 import { ArcRotateCameraPointersInput } from '@babylonjs/core/Cameras/Inputs/arcRotateCameraPointersInput';
+import { Camera } from '@babylonjs/core/Cameras/camera';
 import '@babylonjs/core/Culling/ray';
 import { Engine } from '@babylonjs/core/Engines/engine';
 import { PointerEventTypes } from '@babylonjs/core/Events/pointerEvents';
@@ -22,44 +23,40 @@ import '@babylonjs/core/Rendering/edgesRenderer';
 import '@babylonjs/core/Shaders/line.vertex';
 import '@babylonjs/core/Shaders/line.fragment';
 import { Scene } from '@babylonjs/core/scene';
-import { GLTF2Export } from '@babylonjs/serializers/glTF/2.0/glTFSerializer';
-import { OBJExport } from '@babylonjs/serializers/OBJ/objSerializer';
-import { STLExport } from '@babylonjs/serializers/stl/stlSerializer';
 import { icon } from './icons';
+import {
+  calculateModelStats,
+  centeredBrushOffsets,
+  createProjectPatch,
+  cuboidPositions,
+  DEFAULT_CANVAS,
+  gridCenterOffset,
+  isVoxelShape,
+  keyOf,
+  linePositions,
+  MAX_IMPORT_BYTES,
+  MAX_PROJECT_VOXELS,
+  MAX_SHAPE_SIZE,
+  parseVoxelKey,
+  surfaceVoxels,
+  translateProject,
+  voxelBrushPositions,
+  voxelStampPosition,
+  type CanvasSettings,
+  type PrimitiveData,
+  type ProjectPatch,
+  type ProjectSnapshot,
+  type ShapeType,
+  type VoxelData,
+  type VoxelShapeType,
+} from './model';
+import { affectedChunkKeys, buildVoxelChunk, chunkKeyOf, voxelKeyFromFace } from './voxel-geometry';
+import { clearDraft, loadDraft, saveDraft } from './draft-store';
+import { imageToVoxels, parseVox } from './importers';
 
 type Tool = 'select' | 'add' | 'erase' | 'paint' | 'eyedropper' | 'texture' | 'shape';
-type ShapeType = 'box' | 'pyramid' | 'circle' | 'sphere' | 'cylinder' | 'square' | 'plane' | 'billboard';
-type VoxelShapeType = 'pyramid' | 'sphere' | 'cylinder';
-type ExportFormat = 'glb' | 'gltf' | 'obj' | 'stl' | 'json';
-
-interface VoxelData {
-  x: number;
-  y: number;
-  z: number;
-  color: string;
-  texture?: string;
-}
-
-interface PrimitiveData {
-  id: string;
-  type: ShapeType;
-  x: number;
-  y: number;
-  z: number;
-  color: string;
-  texture?: string;
-  sizeX?: number;
-  sizeY?: number;
-  sizeZ?: number;
-  paint?: PrimitivePaintCell[];
-}
-
-interface PrimitivePaintCell {
-  face: number;
-  u: number;
-  v: number;
-  color: string;
-}
+type ExportFormat = 'glb' | 'gltf' | 'obj' | 'stl' | 'stl-hollow' | 'json';
+type BuildMode = 'brush' | 'line' | 'rectangle' | 'wall' | 'box' | 'hollow' | 'fill' | 'replace';
 
 interface TextureLibraryItem {
   id: string;
@@ -78,17 +75,6 @@ interface PackedTextureLibraryItem {
   height: number;
 }
 
-interface CanvasSettings {
-  width: number;
-  depth: number;
-  height: number;
-}
-
-interface ProjectSnapshot {
-  voxels: VoxelData[];
-  primitives: PrimitiveData[];
-}
-
 type PackedVoxelData = Omit<VoxelData, 'texture'> & { textureId?: number; texture?: string };
 type PackedPrimitiveData = Omit<PrimitiveData, 'texture'> & { textureId?: number; texture?: string };
 
@@ -99,6 +85,13 @@ interface PackedProjectSnapshot {
   textureLibrary?: PackedTextureLibraryItem[];
 }
 
+interface DraftPayload extends PackedProjectSnapshot {
+  format: 'cubeling';
+  version: number;
+  name: string;
+  canvas: CanvasSettings;
+}
+
 const PALETTE = [
   '#f26f4f', '#f6b94f', '#f2df63', '#91c95b', '#42b987',
   '#49a8d8', '#6977d9', '#9a6bd2', '#d46b9d', '#e9e3d7',
@@ -106,10 +99,7 @@ const PALETTE = [
 ];
 
 const MAX_HISTORY = 60;
-const MAX_SHAPE_SIZE = 2048;
-const MAX_VOXEL_SHAPE_VOXELS = 12000;
 const TEXTURE_ALPHA_CUTOFF = 8 / 255;
-const DEFAULT_CANVAS: CanvasSettings = { width: 64, depth: 64, height: 64 };
 let canvasSettings: CanvasSettings = { ...DEFAULT_CANVAS };
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -129,6 +119,7 @@ app.innerHTML = `
         <span class="save-state" id="saveState">Nowy projekt</span>
       </div>
       <div class="top-actions">
+        <button class="icon-button mobile-inspector-toggle" id="inspectorToggle" title="Pokaż ustawienia" aria-expanded="false">${icon('grid', 17)}</button>
         <button class="icon-button" id="undoBtn" title="Cofnij (Ctrl+Z)">${icon('undo')}</button>
         <button class="icon-button" id="redoBtn" title="Ponów (Ctrl+Shift+Z)">${icon('redo')}</button>
         <span class="separator"></span>
@@ -136,14 +127,15 @@ app.innerHTML = `
         <div class="export-wrap">
           <button class="button primary" id="exportBtn" aria-haspopup="menu" aria-expanded="false">${icon('download', 16)} Eksportuj ${icon('arrowDown', 13)}</button>
           <div class="export-menu" id="exportMenu" role="menu" hidden>
-            <button data-format="glb" role="menuitem"><span class="format-badge">GLB</span><span><strong>Binary glTF</strong><small>Model i tekstury w jednym pliku</small></span></button>
+            <button data-format="glb" role="menuitem"><span class="format-badge">GAME</span><span><strong>GLB zoptymalizowany</strong><small>Scalona geometria bez ścian wewnętrznych</small></span></button>
             <button data-format="gltf" role="menuitem"><span class="format-badge">GLTF</span><span><strong>glTF 2.0</strong><small>Standard do web i silników 3D</small></span></button>
             <button data-format="obj" role="menuitem"><span class="format-badge">OBJ</span><span><strong>Wavefront OBJ</strong><small>Uniwersalna geometria siatkowa</small></span></button>
-            <button data-format="stl" role="menuitem"><span class="format-badge">STL</span><span><strong>STL</strong><small>Format do druku 3D</small></span></button>
+            <button data-format="stl" role="menuitem"><span class="format-badge">PRINT</span><span><strong>STL do druku 3D</strong><small>Szczelna powierzchnia bez ukrytych ścian</small></span></button>
+            <button data-format="stl-hollow" role="menuitem"><span class="format-badge">HOLLOW</span><span><strong>Pusty STL</strong><small>Ścianka grubości jednego voxela</small></span></button>
             <button data-format="json" role="menuitem"><span class="format-badge">JSON</span><span><strong>Projekt Cubeling</strong><small>Do dalszej edycji w aplikacji</small></span></button>
           </div>
         </div>
-        <input id="fileInput" type="file" accept="application/json,.json" hidden />
+        <input id="fileInput" type="file" accept="application/json,.json,.vox,image/png,image/jpeg,image/webp" hidden />
       </div>
     </header>
 
@@ -191,6 +183,15 @@ app.innerHTML = `
         </div>
         <div class="viewport-top-left">
           <div class="view-chip">${icon('cube', 14)} Perspektywa</div>
+          <button class="viewport-action" id="centerModelOnCanvasBtn" type="button" title="Przesuń model na środek canvasu">
+            ${icon('focus', 14)} Wyśrodkuj model
+          </button>
+          <button class="viewport-action" id="lowerModelBtn" type="button" title="Obniż cały model o 1 voxel">
+            ${icon('download', 14)} Obniż model −Y
+          </button>
+          <button class="viewport-action" id="raiseModelBtn" type="button" title="Podnieś cały model o 1 voxel">
+            ${icon('upload', 14)} Podnieś model +Y
+          </button>
           <div class="edit-mode-switch" aria-label="Tryb pracy">
             <button class="active" data-mode-tool="add">${icon('plus', 14)} Rysuj voxele</button>
             <button data-mode-tool="select">${icon('focus', 14)} Edytuj obiekt</button>
@@ -203,7 +204,7 @@ app.innerHTML = `
         </div>
         <div class="statusbar">
           <div class="coordinates" id="coordinates">X — &nbsp; Y — &nbsp; Z —</div>
-          <div class="status-center"><span class="status-dot"></span> Gotowy</div>
+          <div class="status-center"><span class="status-dot"></span><span id="workStatus">Gotowy</span><button id="cancelWork" hidden>Anuluj</button></div>
           <div>Siatka 1 × 1</div>
         </div>
       </section>
@@ -219,7 +220,12 @@ app.innerHTML = `
             <div><span>Wybrany kolor</span><strong id="colorValue">${PALETTE[0].toUpperCase()}</strong></div>
             <input type="color" id="customColor" value="${PALETTE[0]}" aria-label="Własny kolor" />
           </div>
+          <div class="brush-size-control">
+            <label for="paintBrushSize"><span>Rozmiar pędzla</span><output id="paintBrushSizeValue">1 × 1</output></label>
+            <input id="paintBrushSize" type="range" min="1" max="15" step="2" value="1" aria-label="Rozmiar pędzla malowania" />
+          </div>
           <div class="palette" id="palette"></div>
+          <div class="recent-palette" id="recentPalette" aria-label="Ostatnie kolory"></div>
         </section>
 
         <section class="panel-section texture-section">
@@ -263,6 +269,61 @@ app.innerHTML = `
           </div>
         </section>
 
+        <section class="panel-section compact-section">
+          <div class="section-heading">
+            <div><span class="eyebrow">BUDOWANIE</span><h2>Narzędzia siatki</h2></div>
+          </div>
+          <label class="control-label"><span>Tryb rysowania</span>
+            <select id="buildMode">
+              <option value="brush">Pojedynczy voxel</option>
+              <option value="line">Linia — dwa punkty</option>
+              <option value="rectangle">Prostokąt X/Z</option>
+              <option value="wall">Ściana — dwa punkty</option>
+              <option value="box">Pełny prostopadłościan</option>
+              <option value="hollow">Pusta bryła</option>
+              <option value="fill">Wypełnienie koloru</option>
+              <option value="replace">Zamień kolor globalnie</option>
+            </select>
+          </label>
+          <div class="toggle-row">
+            <label><input id="symmetryX" type="checkbox" /> Lustro X</label>
+            <label><input id="symmetryZ" type="checkbox" /> Lustro Z</label>
+          </div>
+          <label class="control-label"><span>Aktywna grupa</span><input id="activeGroup" value="Domyślna" maxlength="32" /></label>
+          <div class="toggle-row"><label><input id="hideActiveGroup" type="checkbox" /> Ukryj aktywną grupę</label></div>
+          <div class="view-buttons" aria-label="Widok kamery">
+            <button data-view="perspective">3D</button><button data-view="top">Góra</button><button data-view="front">Przód</button><button data-view="side">Bok</button>
+          </div>
+        </section>
+
+        <section class="panel-section compact-section layer-section">
+          <div class="section-heading">
+            <div><span class="eyebrow">WARSTWY Y</span><h2>Przekrój modelu</h2></div>
+            <strong id="activeLayerLabel">0</strong>
+          </div>
+          <input id="activeLayer" class="layer-range" type="range" min="0" max="63" value="0" />
+          <div class="toggle-row"><label><input id="soloLayer" type="checkbox" /> Tylko ta warstwa</label><label><input id="sliceBelow" type="checkbox" /> Przekrój do Y</label></div>
+          <div class="mini-actions">
+            <button id="layerDown">− Y</button><button id="layerUp">+ Y</button><button id="duplicateLayer">Duplikuj</button><button id="deleteLayer">Usuń</button>
+          </div>
+        </section>
+
+        <section class="panel-section compact-section" id="voxelSelectionSection" hidden>
+          <div class="section-heading">
+            <div><span class="eyebrow">ZAZNACZENIE VOXELI</span><h2><span id="selectedVoxelCount">0</span> elementów</h2></div>
+          </div>
+          <p class="panel-help">Kliknij voxel; Shift+klik zaznacza cały prostopadłościan pomiędzy punktami.</p>
+          <div class="mini-actions selection-actions">
+            <button id="recolorSelection">Koloruj</button><button id="copySelection">Kopiuj</button><button id="deleteSelection" class="danger-text">Usuń</button>
+          </div>
+          <div class="move-grid">
+            <button data-move="-1,0,0">−X</button><button data-move="1,0,0">+X</button>
+            <button data-move="0,-1,0">−Y</button><button data-move="0,1,0">+Y</button>
+            <button data-move="0,0,-1">−Z</button><button data-move="0,0,1">+Z</button>
+          </div>
+          <button class="button secondary full-button" id="assignSelectionGroup">Przypisz aktywną grupę</button>
+        </section>
+
         <section class="panel-section canvas-section">
           <div class="section-heading">
             <div><span class="eyebrow">OBSZAR ROBOCZY</span><h2>Canvas voxelowy</h2></div>
@@ -296,7 +357,7 @@ app.innerHTML = `
         </section>
       </aside>
     </main>
-    <div class="toast" id="toast"><span class="toast-icon">${icon('check', 15)}</span><span id="toastText">Gotowe</span></div>
+    <div class="toast" id="toast" role="status" aria-live="polite"><span class="toast-icon">${icon('check', 15)}</span><span id="toastText">Gotowe</span></div>
     <div class="modal-backdrop" id="confirmModal" hidden>
       <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
         <div class="modal-icon">${icon('reset', 23)}</div>
@@ -374,6 +435,13 @@ engine.setHardwareScalingLevel(1 / Math.min(window.devicePixelRatio || 1, 1.25))
 const scene = new Scene(engine);
 scene.clearColor = new Color4(0.905, 0.902, 0.875, 1);
 scene.skipPointerMovePicking = false;
+let renderUntil = performance.now() + 1_000;
+const requestSceneRender = (duration = 120): void => { renderUntil = Math.max(renderUntil, performance.now() + duration); };
+canvas.addEventListener('pointermove', () => requestSceneRender());
+canvas.addEventListener('pointerdown', () => requestSceneRender(300));
+canvas.addEventListener('wheel', () => requestSceneRender(300), { passive: true });
+scene.onNewMeshAddedObservable.add(() => requestSceneRender());
+scene.onMeshRemovedObservable.add(() => requestSceneRender());
 
 const camera = new ArcRotateCamera('camera', -Math.PI / 4, Math.PI / 3.2, 18, new Vector3(0, 1.5, 0), scene);
 camera.lowerRadiusLimit = 4;
@@ -474,6 +542,11 @@ function applyCanvasVisuals(frame = false): void {
   createGrid();
   camera.upperRadiusLimit = 10000;
   document.querySelector('#canvasSizeDisplay')!.textContent = `${canvasSettings.width} × ${canvasSettings.depth}`;
+  const layerInput = document.querySelector<HTMLInputElement>('#activeLayer');
+  if (layerInput) {
+    layerInput.max = String(canvasSettings.height - 1);
+    layerInput.value = String(Math.min(Number(layerInput.value), canvasSettings.height - 1));
+  }
   if (frame) {
     camera.setTarget(new Vector3((minX + maxX) / 2, 0, (minZ + maxZ) / 2));
     camera.radius = Math.max(canvasSettings.width, canvasSettings.depth) * 0.92;
@@ -494,15 +567,30 @@ deleteHoverMaterial.specularColor = Color3.Black();
 deleteHoverMaterial.alpha = 0.88;
 deleteHoverMaterial.freeze();
 
-const voxels = new Map<string, Mesh>();
+const voxels = new Map<string, VoxelData>();
+const voxelChunks = new Map<string, Mesh>();
+const voxelChunkMembers = new Map<string, Set<string>>();
+const dirtyVoxelChunks = new Set<string>();
+let voxelChunkFramePending = false;
+let visibleLayerMin = 0;
+let visibleLayerMax = Infinity;
+let soloLayer: number | null = null;
+const hiddenGroups = new Set<string>();
 const primitives = new Map<string, Mesh>();
 const materials = new Map<string, StandardMaterial>();
+const voxelChunkMaterial = new StandardMaterial('voxel-chunk-material', scene);
+voxelChunkMaterial.diffuseColor = Color3.White();
+voxelChunkMaterial.ambientColor = new Color3(0.22, 0.22, 0.22);
+voxelChunkMaterial.specularColor = Color3.Black();
+voxelChunkMaterial.specularPower = 0;
+voxelChunkMaterial.freeze();
 let currentTool: Tool = 'add';
 let currentShape: ShapeType = 'box';
 let currentShapeSize = { x: 1, y: 1, z: 1 };
 let selectedPrimitiveId: string | null = null;
 let canvasConfigured = false;
 let currentColor = PALETTE[0];
+let paintBrushSize = 1;
 let currentTexture: string | null = null;
 let currentTexturePixels: Uint8ClampedArray | null = null;
 let currentTexturePixelSize = { width: 0, height: 0 };
@@ -511,23 +599,119 @@ let textureStampPending = false;
 let stampRotation = 0;
 const textureLibrary = new Map<string, TextureLibraryItem>();
 let hoveredMesh: Mesh | null = null;
+let lastHoveredSurfaceNormal = Vector3.Up();
 let hoveredTool: Tool | null = null;
 let previewPosition: Vector3 | null = null;
-let history: ProjectSnapshot[] = [];
-let historyIndex = -1;
+let history: ProjectPatch[] = [];
+let historyIndex = 0;
+let historyState: ProjectSnapshot = { voxels: [], primitives: [] };
 let projectDirty = false;
 let toastTimer: number | undefined;
+let draftTimer: number | undefined;
 let copiedPrimitive: PrimitiveData | null = null;
+let copiedVoxels: VoxelData[] = [];
 let pasteOffset = 0;
 let paintStrokeActive = false;
 let paintStrokeChanged = false;
 const paintedInStroke = new Set<string>();
 let hoveredOriginalMaterial: Mesh['material'] = null;
+let hoveredVoxelKey: string | null = null;
+const selectedVoxelKeys = new Set<string>();
+let selectionAnchorKey: string | null = null;
+let buildAnchor: Vector3 | null = null;
+let buildMode: BuildMode = 'brush';
+let symmetryX = false;
+let symmetryZ = false;
+let activeGroup = 'Domyślna';
 
-const keyOf = (x: number, y: number, z: number) => `${x},${y},${z}`;
+function isVoxelVisible(voxel: VoxelData): boolean {
+  if (soloLayer !== null && voxel.y !== soloLayer) return false;
+  if (voxel.y < visibleLayerMin || voxel.y > visibleLayerMax) return false;
+  return !voxel.group || !hiddenGroups.has(voxel.group);
+}
+
+function rebuildVoxelChunk(chunkKey: string): void {
+  voxelChunks.get(chunkKey)?.dispose(false, false);
+  voxelChunks.delete(chunkKey);
+  const memberKeys = voxelChunkMembers.get(chunkKey);
+  if (!memberKeys?.size) return;
+  const members = [...memberKeys].map((key) => voxels.get(key)).filter((voxel): voxel is VoxelData => Boolean(voxel));
+  const mesh = buildVoxelChunk({
+    scene,
+    chunkKey,
+    voxels: members,
+    getVoxel: (key) => voxels.get(key),
+    isVisible: isVoxelVisible,
+    material: voxelChunkMaterial,
+  });
+  if (mesh) voxelChunks.set(chunkKey, mesh);
+}
+
+function flushVoxelChunks(): void {
+  voxelChunkFramePending = false;
+  const pending = [...dirtyVoxelChunks];
+  dirtyVoxelChunks.clear();
+  pending.forEach(rebuildVoxelChunk);
+  requestSceneRender();
+}
+
+function scheduleVoxelChunkRebuild(keys: Iterable<string>): void {
+  for (const key of keys) dirtyVoxelChunks.add(key);
+  if (voxelChunkFramePending) return;
+  voxelChunkFramePending = true;
+  requestAnimationFrame(flushVoxelChunks);
+}
+
+function markVoxelDirty(voxel: Pick<VoxelData, 'x' | 'y' | 'z'>): void {
+  scheduleVoxelChunkRebuild(affectedChunkKeys(voxel.x, voxel.y, voxel.z));
+}
+
+function setVoxelData(data: VoxelData): void {
+  const normalized = { ...data, color: data.color.toLowerCase() };
+  const key = keyOf(normalized.x, normalized.y, normalized.z);
+  voxels.set(key, normalized);
+  const chunkKey = chunkKeyOf(normalized.x, normalized.y, normalized.z);
+  const members = voxelChunkMembers.get(chunkKey) ?? new Set<string>();
+  members.add(key);
+  voxelChunkMembers.set(chunkKey, members);
+  markVoxelDirty(normalized);
+}
+
+function deleteVoxelData(key: string): VoxelData | undefined {
+  const voxel = voxels.get(key);
+  if (!voxel) return undefined;
+  voxels.delete(key);
+  const chunkKey = chunkKeyOf(voxel.x, voxel.y, voxel.z);
+  const members = voxelChunkMembers.get(chunkKey);
+  members?.delete(key);
+  if (!members?.size) voxelChunkMembers.delete(chunkKey);
+  markVoxelDirty(voxel);
+  return voxel;
+}
+
+function rebuildAllVoxelChunks(): void {
+  voxelChunks.forEach((mesh) => mesh.dispose(false, false));
+  voxelChunks.clear();
+  dirtyVoxelChunks.clear();
+  voxelChunkMembers.forEach((_members, key) => dirtyVoxelChunks.add(key));
+  flushVoxelChunks();
+}
+
+function syncGroupVisibility(): void {
+  primitives.forEach((mesh) => {
+    const group = String(mesh.metadata?.group ?? '');
+    mesh.setEnabled(!group || !hiddenGroups.has(group));
+  });
+  rebuildAllVoxelChunks();
+}
 
 function clearHoverOutline(mesh: Mesh | null): void {
   if (!mesh) return;
+  if (mesh.metadata?.isVoxelChunk) {
+    hoverVoxelBox.setEnabled(false);
+    hoveredVoxelKey = null;
+    return;
+  }
   mesh.disableEdgesRendering();
   if (hoveredOriginalMaterial) {
     mesh.material = hoveredOriginalMaterial;
@@ -535,7 +719,27 @@ function clearHoverOutline(mesh: Mesh | null): void {
   }
 }
 
-function applyHoverOutline(mesh: Mesh): void {
+function applyHoverOutline(mesh: Mesh, normal: Vector3 | null = null): void {
+  if (mesh.metadata?.isVoxelChunk) {
+    const voxel = getVoxelFromMesh(mesh);
+    if (!voxel) return;
+    if (normal) lastHoveredSurfaceNormal = dominantGridNormal(normal);
+    hoverVoxelBox.position.set(voxel.x, voxel.y, voxel.z);
+    hoverVoxelBox.scaling.set(1, 1, 1);
+    if (currentTool === 'paint' && paintBrushSize > 1) {
+      const surfaceNormal = lastHoveredSurfaceNormal;
+      const footprintScale = paintBrushSize / 1.025;
+      if (surfaceNormal.x) hoverVoxelBox.scaling.set(1, footprintScale, footprintScale);
+      else if (surfaceNormal.y) hoverVoxelBox.scaling.set(footprintScale, 1, footprintScale);
+      else hoverVoxelBox.scaling.set(footprintScale, footprintScale, 1);
+    }
+    hoverVoxelBox.edgesColor = currentTool === 'erase'
+      ? new Color4(0.95, 0.2, 0.12, 1)
+      : currentTool === 'texture' ? new Color4(0.16, 0.55, 0.95, 1) : new Color4(1, 1, 1, 0.95);
+    hoverVoxelBox.setEnabled(true);
+    hoveredVoxelKey = keyOf(voxel.x, voxel.y, voxel.z);
+    return;
+  }
   if (currentTool === 'erase') {
     hoveredOriginalMaterial = mesh.material;
     mesh.material = deleteHoverMaterial;
@@ -647,13 +851,22 @@ selectionBox.edgesWidth = 2.4;
 selectionBox.edgesColor = new Color4(0.96, 0.34, 0.18, 1);
 selectionBox.setEnabled(false);
 
+const hoverVoxelBox = MeshBuilder.CreateBox('voxel-hover-box', { size: 1.025 }, scene);
+hoverVoxelBox.material = selectionMaterial;
+hoverVoxelBox.isPickable = false;
+hoverVoxelBox.enableEdgesRendering(0.999);
+hoverVoxelBox.edgesWidth = 2.2;
+hoverVoxelBox.setEnabled(false);
+
 const stampPreview = MeshBuilder.CreatePlane('stamp-preview', { size: 1, sideOrientation: Mesh.DOUBLESIDE }, scene);
 const stampPreviewMaterial = new StandardMaterial('stamp-preview-material', scene);
 stampPreviewMaterial.diffuseColor = Color3.White();
+stampPreviewMaterial.emissiveColor = Color3.White();
 stampPreviewMaterial.ambientColor = new Color3(0.22, 0.22, 0.22);
 stampPreviewMaterial.specularColor = new Color3(0.18, 0.18, 0.18);
 stampPreviewMaterial.alpha = 1;
 stampPreviewMaterial.useAlphaFromDiffuseTexture = true;
+stampPreviewMaterial.backFaceCulling = false;
 stampPreviewMaterial.disableDepthWrite = true;
 stampPreviewMaterial.zOffset = -2;
 stampPreview.material = stampPreviewMaterial;
@@ -861,7 +1074,10 @@ function refreshStampPreviewTexture(): void {
   texture.wrapV = Texture.CLAMP_ADDRESSMODE;
   stampPreviewTexture = texture;
   stampPreviewMaterial.diffuseTexture = stampPreviewTexture;
-  stampPreviewMaterial.opacityTexture = stampPreviewTexture;
+  // Alpha is already read from the diffuse texture. Reusing the DynamicTexture
+  // as opacityTexture made the preview fully transparent on some WebGL paths.
+  stampPreviewMaterial.opacityTexture = null;
+  requestSceneRender(1_000);
 }
 
 function rotateStamp(): void {
@@ -894,17 +1110,20 @@ function updateStampPreview(
   }
   if (updateBoxStampPreview(mesh, normal, uv)) {
     stampPreview.setEnabled(false);
+    requestSceneRender(300);
     return;
   }
   stampBoxPreview.setEnabled(false);
-  if (!mesh.metadata.isVoxel) return;
+  if (!mesh.metadata.isVoxelChunk) return;
   const logical = getLogicalPosition(mesh);
   const stampSize = getStampPixelSize();
   const startX = logical.x - Math.floor(stampSize.width / 2);
   const startZ = logical.z - Math.floor(stampSize.height / 2);
   const point = new Vector3(
     startX + (stampSize.width - 1) / 2,
-    logical.y + 0.501,
+    // Keep the overlay clearly above the voxel top even for a distant camera;
+    // 0.001 caused depth fighting and made the guide intermittently disappear.
+    logical.y + 0.51,
     startZ + (stampSize.height - 1) / 2,
   );
   stampPreview.rotation.set(0, 0, 0);
@@ -912,6 +1131,7 @@ function updateStampPreview(
   stampPreview.scaling.set(stampSize.width, stampSize.height, 1);
   stampPreview.position.copyFrom(point);
   stampPreview.setEnabled(true);
+  requestSceneRender(300);
 }
 
 const gizmoManager = new GizmoManager(scene);
@@ -1000,7 +1220,7 @@ function configureScaleAxes(mesh: Mesh): void {
 
 scaleGizmo.onDragStartObservable.add(() => {
   const mesh = scaleGizmo.attachedMesh as Mesh | null;
-  if (!mesh?.metadata?.isModel || mesh.metadata.isVoxel) return;
+  if (!mesh?.metadata?.isModel || mesh.metadata.isVoxelChunk) return;
   mesh.unfreezeWorldMatrix();
   scaleStartSize = {
     x: Number(mesh.metadata.sizeX ?? 1),
@@ -1011,7 +1231,7 @@ scaleGizmo.onDragStartObservable.add(() => {
 
 scaleGizmo.onDragObservable.add(() => {
   const mesh = scaleGizmo.attachedMesh as Mesh | null;
-  if (!mesh?.metadata?.isModel || mesh.metadata.isVoxel || !scaleStartSize) return;
+  if (!mesh?.metadata?.isModel || mesh.metadata.isVoxelChunk || !scaleStartSize) return;
   const next = normalizeShapeSize(sizeFromMeshScale(mesh));
   // Nie nadpisujemy transformacji pomiędzy progami snapa — gizmo potrzebuje
   // tych zdarzeń, żeby uzbierać dystans do następnego kroku. Kotwiczenie jest
@@ -1035,7 +1255,7 @@ scaleGizmo.onDragObservable.add(() => {
 
 scaleGizmo.onDragEndObservable.add(() => {
   const mesh = scaleGizmo.attachedMesh as Mesh | null;
-  if (!mesh?.metadata?.isModel || mesh.metadata.isVoxel || !scaleStartSize) return;
+  if (!mesh?.metadata?.isModel || mesh.metadata.isVoxelChunk || !scaleStartSize) return;
   const next = normalizeShapeSize(sizeFromMeshScale(mesh));
   const changed = next.x !== scaleStartSize.x || next.y !== scaleStartSize.y || next.z !== scaleStartSize.z;
   mesh.metadata.sizeX = next.x;
@@ -1072,14 +1292,14 @@ function logicalPositionFromMesh(mesh: Mesh): Vector3 {
 
 positionGizmo.onDragStartObservable.add(() => {
   const mesh = positionGizmo.attachedMesh as Mesh | null;
-  if (!mesh?.metadata?.isModel || mesh.metadata.isVoxel) return;
+  if (!mesh?.metadata?.isModel || mesh.metadata.isVoxelChunk) return;
   moveStartPosition = getLogicalPosition(mesh).clone();
   mesh.unfreezeWorldMatrix();
 });
 
 positionGizmo.onDragEndObservable.add(() => {
   const mesh = positionGizmo.attachedMesh as Mesh | null;
-  if (!mesh?.metadata?.isModel || mesh.metadata.isVoxel || !moveStartPosition) return;
+  if (!mesh?.metadata?.isModel || mesh.metadata.isVoxelChunk || !moveStartPosition) return;
   const next = logicalPositionFromMesh(mesh);
   const changed = !next.equals(moveStartPosition);
   mesh.metadata.logicalPosition = next;
@@ -1118,17 +1338,62 @@ const shapeNames: Record<ShapeType, string> = {
 
 function clearSelection(): void {
   selectedPrimitiveId = null;
+  selectedVoxelKeys.clear();
+  selectionAnchorKey = null;
   attachTransformGizmo(null);
   selectionBox.setEnabled(false);
   (document.querySelector('#transformSection') as HTMLElement).hidden = true;
+  (document.querySelector('#voxelSelectionSection') as HTMLElement).hidden = true;
+}
+
+function refreshVoxelSelection(): void {
+  [...selectedVoxelKeys].forEach((key) => { if (!voxels.has(key)) selectedVoxelKeys.delete(key); });
+  const section = document.querySelector('#voxelSelectionSection') as HTMLElement;
+  section.hidden = selectedVoxelKeys.size === 0;
+  document.querySelector('#selectedVoxelCount')!.textContent = String(selectedVoxelKeys.size);
+  if (!selectedVoxelKeys.size) {
+    selectionBox.setEnabled(false);
+    return;
+  }
+  const points = [...selectedVoxelKeys].map(parseVoxelKey);
+  let minX = Infinity; let minY = Infinity; let minZ = Infinity;
+  let maxX = -Infinity; let maxY = -Infinity; let maxZ = -Infinity;
+  points.forEach(({ x, y, z }) => {
+    minX = Math.min(minX, x); minY = Math.min(minY, y); minZ = Math.min(minZ, z);
+    maxX = Math.max(maxX, x); maxY = Math.max(maxY, y); maxZ = Math.max(maxZ, z);
+  });
+  selectionBox.position.set((minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2);
+  selectionBox.scaling.set(maxX - minX + 1.06, maxY - minY + 1.06, maxZ - minZ + 1.06);
+  selectionBox.setEnabled(true);
+}
+
+function selectVoxel(mesh: Mesh, extendRange: boolean, toggle: boolean): void {
+  const voxel = getVoxelFromMesh(mesh);
+  if (!voxel) return;
+  const key = keyOf(voxel.x, voxel.y, voxel.z);
+  selectedPrimitiveId = null;
+  attachTransformGizmo(null);
+  (document.querySelector('#transformSection') as HTMLElement).hidden = true;
+  if (extendRange && selectionAnchorKey) {
+    const anchor = parseVoxelKey(selectionAnchorKey);
+    cuboidPositions(anchor, voxel).forEach((point) => {
+      const candidate = keyOf(point.x, point.y, point.z);
+      if (voxels.has(candidate)) selectedVoxelKeys.add(candidate);
+    });
+  } else if (toggle) {
+    if (selectedVoxelKeys.has(key)) selectedVoxelKeys.delete(key); else selectedVoxelKeys.add(key);
+    selectionAnchorKey = key;
+  } else {
+    selectedVoxelKeys.clear();
+    selectedVoxelKeys.add(key);
+    selectionAnchorKey = key;
+  }
+  refreshVoxelSelection();
 }
 
 function selectPrimitive(mesh: Mesh, mode: 'scale' | 'move' = 'scale'): void {
-  if (mesh.metadata?.isVoxel) {
-    clearSelection();
-    showToast('Voxel ma stały rozmiar 1 × 1 × 1');
-    return;
-  }
+  if (mesh.metadata?.isVoxelChunk) return;
+  clearSelection();
   selectedPrimitiveId = String(mesh.metadata.id);
   gizmoMode = mode;
   configureScaleAxes(mesh);
@@ -1218,6 +1483,7 @@ function flushPaintTextureUpdates(): void {
     faces.forEach((face) => resources.textures[face]?.update(true));
   });
   pendingPaintTextureUpdates.clear();
+  requestSceneRender();
 }
 
 function schedulePaintTextureUpdate(mesh: Mesh, face: number): void {
@@ -1306,11 +1572,6 @@ function fillBoxPaintCell(mesh: Mesh, face: number, u: number, v: number, color:
   const y1 = Math.max(y0 + 1, Math.ceil((v + 1) * textureSize.height / logicalSize.height));
   context.fillStyle = color;
   context.fillRect(x0, y0, x1 - x0, y1 - y0);
-}
-
-function drawBoxPaintCell(mesh: Mesh, face: number, u: number, v: number, color: string): void {
-  fillBoxPaintCell(mesh, face, u, v, color);
-  schedulePaintTextureUpdate(mesh, face);
 }
 
 function drawBoxPaintFace(mesh: Mesh, face: number): void {
@@ -1428,16 +1689,8 @@ async function decodeTexturePixels(textureData: string): Promise<PixelTextureDat
   };
 }
 
-function createVoxel(data: VoxelData): Mesh {
-  const mesh = createShapeMesh(`voxel-${keyOf(data.x, data.y, data.z)}`, 'voxel');
-  const logicalPosition = new Vector3(data.x, data.y, data.z);
-  positionShape(mesh, 'voxel', logicalPosition);
-  mesh.material = getMaterial(data.color, data.texture);
-  mesh.isPickable = true;
-  mesh.metadata = { isModel: true, isVoxel: true, kind: 'voxel', color: data.color.toLowerCase(), texture: data.texture, logicalPosition };
-  mesh.freezeWorldMatrix();
-  voxels.set(keyOf(data.x, data.y, data.z), mesh);
-  return mesh;
+function createVoxel(data: VoxelData): void {
+  setVoxelData(data);
 }
 
 function createPrimitive(data: PrimitiveData): Mesh {
@@ -1451,7 +1704,8 @@ function createPrimitive(data: PrimitiveData): Mesh {
   mesh.isPickable = true;
   const paintCells = new Map<string, string>();
   data.paint?.forEach((cell) => paintCells.set(`${cell.face}:${cell.u}:${cell.v}`, cell.color.toLowerCase()));
-  mesh.metadata = { isModel: true, kind: data.type, id: data.id, color: data.color.toLowerCase(), texture: data.texture, logicalPosition, sizeX, sizeY, sizeZ, paintCells };
+  mesh.metadata = { isModel: true, kind: data.type, id: data.id, color: data.color.toLowerCase(), texture: data.texture, logicalPosition, sizeX, sizeY, sizeZ, paintCells, group: data.group };
+  mesh.setEnabled(!data.group || !hiddenGroups.has(data.group));
   refreshPrimitivePaint(mesh);
   if (data.type !== 'billboard') mesh.freezeWorldMatrix();
   primitives.set(data.id, mesh);
@@ -1465,13 +1719,7 @@ function createPrimitive(data: PrimitiveData): Mesh {
 
 function serializeVoxels(): VoxelData[] {
   return [...voxels.values()]
-    .map((mesh) => ({
-      x: Math.round(mesh.metadata.logicalPosition.x),
-      y: Math.round(mesh.metadata.logicalPosition.y),
-      z: Math.round(mesh.metadata.logicalPosition.z),
-      color: String(mesh.metadata.color),
-      ...(mesh.metadata.texture ? { texture: String(mesh.metadata.texture) } : {}),
-    }))
+    .map((voxel) => ({ ...voxel }))
     .sort((a, b) => a.y - b.y || a.z - b.z || a.x - b.x);
 }
 
@@ -1492,6 +1740,7 @@ function serializePrimitive(mesh: Mesh): PrimitiveData {
       sizeZ: Number(mesh.metadata.sizeZ ?? 1),
       ...(mesh.metadata.texture ? { texture: String(mesh.metadata.texture) } : {}),
       ...(paint.length ? { paint } : {}),
+      ...(mesh.metadata.group ? { group: String(mesh.metadata.group) } : {}),
     };
 }
 
@@ -1500,6 +1749,13 @@ function serializePrimitives(): PrimitiveData[] {
 }
 
 function copySelectedPrimitive(): void {
+  if (selectedVoxelKeys.size) {
+    copiedVoxels = [...selectedVoxelKeys].map((key) => structuredClone(voxels.get(key)!)).filter(Boolean);
+    copiedPrimitive = null;
+    pasteOffset = 0;
+    showToast(`Skopiowano ${copiedVoxels.length} voxeli`);
+    return;
+  }
   if (!selectedPrimitiveId) {
     showToast('Najpierw zaznacz kształt do skopiowania', true);
     return;
@@ -1507,11 +1763,35 @@ function copySelectedPrimitive(): void {
   const mesh = primitives.get(selectedPrimitiveId);
   if (!mesh) return;
   copiedPrimitive = structuredClone(serializePrimitive(mesh));
+  copiedVoxels = [];
   pasteOffset = 0;
   showToast(`Skopiowano: ${shapeNames[copiedPrimitive.type]}`);
 }
 
 function pastePrimitive(): void {
+  if (copiedVoxels.length) {
+    if (voxels.size + copiedVoxels.length > MAX_PROJECT_VOXELS) {
+      showToast(`Wklejenie przekroczyłoby limit ${MAX_PROJECT_VOXELS.toLocaleString('pl-PL')} voxeli`, true);
+      return;
+    }
+    pasteOffset += 1;
+    const next = copiedVoxels.map((voxel) => ({ ...voxel, x: voxel.x + pasteOffset, z: voxel.z + pasteOffset }));
+    if (next.some((voxel) => isPositionOccupied(new Vector3(voxel.x, voxel.y, voxel.z)))) {
+      showToast('Brak miejsca na wklejenie zaznaczenia', true);
+      return;
+    }
+    clearSelection();
+    next.forEach((voxel) => {
+      createVoxel(voxel);
+      selectedVoxelKeys.add(keyOf(voxel.x, voxel.y, voxel.z));
+    });
+    flushVoxelChunks();
+    refreshVoxelSelection();
+    pushHistory();
+    updateStats();
+    showToast(`Wklejono ${next.length} voxeli`);
+    return;
+  }
   if (!copiedPrimitive) {
     showToast('Schowek kształtów jest pusty', true);
     return;
@@ -1527,6 +1807,61 @@ function pastePrimitive(): void {
   pushHistory();
   updateStats();
   showToast(`Wklejono kopię · przesunięcie ${pasteOffset} kom.`);
+}
+
+function deleteSelectedVoxels(): void {
+  if (!selectedVoxelKeys.size) return;
+  const count = selectedVoxelKeys.size;
+  [...selectedVoxelKeys].forEach(deleteVoxelData);
+  flushVoxelChunks();
+  clearSelection();
+  pushHistory();
+  updateStats();
+  showToast(`Usunięto ${count} voxeli`);
+}
+
+function recolorSelectedVoxels(): void {
+  if (!selectedVoxelKeys.size) return;
+  selectedVoxelKeys.forEach((key) => {
+    const voxel = voxels.get(key);
+    if (voxel) setVoxelData({ ...voxel, color: currentColor, texture: undefined });
+  });
+  flushVoxelChunks();
+  pushHistory();
+  showToast(`Pokolorowano ${selectedVoxelKeys.size} voxeli`);
+}
+
+function moveSelectedVoxels(dx: number, dy: number, dz: number): void {
+  if (!selectedVoxelKeys.size) return;
+  const source = [...selectedVoxelKeys].map((key) => voxels.get(key)).filter((voxel): voxel is VoxelData => Boolean(voxel));
+  const sourceKeys = new Set(selectedVoxelKeys);
+  const moved = source.map((voxel) => ({ ...voxel, x: voxel.x + dx, y: voxel.y + dy, z: voxel.z + dz }));
+  if (moved.some((voxel) => voxel.y < 0 || (voxels.has(keyOf(voxel.x, voxel.y, voxel.z)) && !sourceKeys.has(keyOf(voxel.x, voxel.y, voxel.z))))) {
+    showToast('Nie można przesunąć zaznaczenia w to miejsce', true);
+    return;
+  }
+  sourceKeys.forEach(deleteVoxelData);
+  selectedVoxelKeys.clear();
+  moved.forEach((voxel) => {
+    setVoxelData(voxel);
+    selectedVoxelKeys.add(keyOf(voxel.x, voxel.y, voxel.z));
+  });
+  selectionAnchorKey = selectedVoxelKeys.values().next().value ?? null;
+  flushVoxelChunks();
+  refreshVoxelSelection();
+  pushHistory();
+  updateStats();
+}
+
+function assignSelectionGroup(): void {
+  if (!selectedVoxelKeys.size) return;
+  selectedVoxelKeys.forEach((key) => {
+    const voxel = voxels.get(key);
+    if (voxel) setVoxelData({ ...voxel, group: activeGroup });
+  });
+  flushVoxelChunks();
+  pushHistory();
+  showToast(`Przypisano grupę „${activeGroup}”`);
 }
 
 function serializeProject(): ProjectSnapshot {
@@ -1589,40 +1924,72 @@ function loadProject(data: ProjectSnapshot): void {
   clearHoverOutline(hoveredMesh);
   clearSelection();
   hoveredMesh = null;
-  voxels.forEach((mesh) => mesh.dispose());
+  voxelChunks.forEach((mesh) => mesh.dispose(false, false));
   primitives.forEach((mesh) => {
     disposeBoxPaintResources(mesh);
     mesh.dispose();
   });
   voxels.clear();
+  voxelChunks.clear();
+  voxelChunkMembers.clear();
+  dirtyVoxelChunks.clear();
   primitives.clear();
   data.voxels.forEach(createVoxel);
   data.primitives.forEach(createPrimitive);
+  flushVoxelChunks();
   updateStats();
 }
 
 function pushHistory(): void {
-  history = history.slice(0, historyIndex + 1);
-  history.push(serializeProject());
+  const next = serializeProject();
+  const patch = createProjectPatch(historyState, next);
+  if (!patch.voxels.length && !patch.primitives.length) return;
+  history = history.slice(0, historyIndex);
+  history.push(patch);
   if (history.length > MAX_HISTORY) history.shift();
-  historyIndex = history.length - 1;
+  historyIndex = history.length;
+  historyState = next;
   updateHistoryButtons();
   setProjectDirty(true);
 }
 
+function applyHistoryPatch(patch: ProjectPatch, direction: 'undo' | 'redo'): void {
+  clearSelection();
+  patch.voxels.forEach((change) => {
+    const value = direction === 'undo' ? change.before : change.after;
+    if (value) setVoxelData(structuredClone(value));
+    else deleteVoxelData(change.key);
+  });
+  patch.primitives.forEach((change) => {
+    const existing = primitives.get(change.key);
+    if (existing) {
+      disposeBoxPaintResources(existing);
+      existing.dispose();
+      primitives.delete(change.key);
+    }
+    const value = direction === 'undo' ? change.before : change.after;
+    if (value) createPrimitive(structuredClone(value));
+  });
+  flushVoxelChunks();
+  updateStats();
+  historyState = serializeProject();
+}
+
 function undo(): void {
   if (historyIndex <= 0) return;
+  const patch = history[historyIndex - 1];
   historyIndex -= 1;
-  loadProject(history[historyIndex]);
+  applyHistoryPatch(patch, 'undo');
   updateHistoryButtons();
   setProjectDirty(true);
   showToast('Cofnięto ostatnią zmianę');
 }
 
 function redo(): void {
-  if (historyIndex >= history.length - 1) return;
+  if (historyIndex >= history.length) return;
+  const patch = history[historyIndex];
+  applyHistoryPatch(patch, 'redo');
   historyIndex += 1;
-  loadProject(history[historyIndex]);
   updateHistoryButtons();
   setProjectDirty(true);
   showToast('Przywrócono zmianę');
@@ -1630,107 +1997,232 @@ function redo(): void {
 
 function updateHistoryButtons(): void {
   (document.querySelector('#undoBtn') as HTMLButtonElement).disabled = historyIndex <= 0;
-  (document.querySelector('#redoBtn') as HTMLButtonElement).disabled = historyIndex >= history.length - 1;
+  (document.querySelector('#redoBtn') as HTMLButtonElement).disabled = historyIndex >= history.length;
 }
 
-function addVoxel(position: Vector3, commit = true): boolean {
-  const x = Math.round(position.x);
-  const y = Math.max(0, Math.round(position.y));
-  const z = Math.round(position.z);
-  const logical = new Vector3(x, y, z);
-  if (isPositionOccupied(logical)) return false;
-  const pixelColor = currentTexturePixels ? sampleTextureColor(logical) : null;
-  createVoxel({ x, y, z, color: pixelColor ?? currentColor });
-  if (commit) {
+function withSymmetry(points: Array<{ x: number; y: number; z: number }>): Array<{ x: number; y: number; z: number }> {
+  const { minX, maxX, minZ, maxZ } = getCanvasBounds();
+  const result = new Map<string, { x: number; y: number; z: number }>();
+  points.forEach((point) => {
+    const xs = symmetryX ? [point.x, minX + maxX - point.x] : [point.x];
+    const zs = symmetryZ ? [point.z, minZ + maxZ - point.z] : [point.z];
+    xs.forEach((x) => zs.forEach((z) => result.set(keyOf(x, point.y, z), { x, y: point.y, z })));
+  });
+  return [...result.values()];
+}
+
+function addVoxelPositions(points: Array<{ x: number; y: number; z: number }>, commit = true): number {
+  const candidates = withSymmetry(points)
+    .filter((point) => point.y >= 0 && !isPositionOccupied(new Vector3(point.x, point.y, point.z)));
+  if (voxels.size + candidates.length > MAX_PROJECT_VOXELS) {
+    showToast(`Projekt może zawierać maksymalnie ${MAX_PROJECT_VOXELS.toLocaleString('pl-PL')} voxeli`, true);
+    return 0;
+  }
+  candidates.forEach(({ x, y, z }) => {
+    const logical = new Vector3(x, y, z);
+    const pixelColor = currentTexturePixels ? sampleTextureColor(logical) : null;
+    createVoxel({ x, y, z, color: pixelColor ?? currentColor, group: activeGroup });
+  });
+  if (candidates.length && commit) {
+    flushVoxelChunks();
     pushHistory();
     updateStats();
   }
-  return true;
+  return candidates.length;
 }
 
-function isVoxelShape(type: ShapeType): type is VoxelShapeType {
-  return type === 'pyramid' || type === 'sphere' || type === 'cylinder';
+function addVoxel(position: Vector3, commit = true): boolean {
+  return addVoxelPositions([{
+    x: Math.round(position.x),
+    y: Math.max(0, Math.round(position.y)),
+    z: Math.round(position.z),
+  }], commit) > 0;
 }
 
-function ellipseAxisDistance(index: number, size: number): number {
-  if (size <= 1) return 0;
-  const center = (size - 1) / 2;
-  // Half-cell inset keeps small even and odd diameters circular instead of
-  // turning 3x3/6x6 footprints into almost solid squares.
-  const radius = size === 2 ? 1 : (size - 0.5) / 2;
-  return ((index - center) / radius) ** 2;
-}
-
-function generateVoxelShapeOffsets(type: VoxelShapeType, size: { x: number; y: number; z: number }): Vector3[] | null {
-  const boundingVolume = size.x * size.y * size.z;
-  if (!Number.isSafeInteger(boundingVolume) || boundingVolume > MAX_VOXEL_SHAPE_VOXELS * 4) return null;
-  const offsets: Vector3[] = [];
-  const append = (x: number, y: number, z: number): boolean => {
-    if (offsets.length >= MAX_VOXEL_SHAPE_VOXELS) return false;
-    offsets.push(new Vector3(x, y, z));
-    return true;
-  };
-
-  if (type === 'pyramid') {
-    const maxInsetX = Math.floor((size.x - 1) / 2);
-    const maxInsetZ = Math.floor((size.z - 1) / 2);
-    for (let y = 0; y < size.y; y += 1) {
-      const progress = size.y === 1 ? 0 : y / (size.y - 1);
-      const insetX = Math.round(progress * maxInsetX);
-      const insetZ = Math.round(progress * maxInsetZ);
-      for (let z = insetZ; z < size.z - insetZ; z += 1) {
-        for (let x = insetX; x < size.x - insetX; x += 1) {
-          if (!append(x, y, z)) return null;
-        }
+function floodFillVoxel(startKey: string): void {
+  const start = voxels.get(startKey);
+  if (!start || start.color === currentColor.toLowerCase()) return;
+  const sourceColor = start.color;
+  const queue = [start];
+  const visited = new Set<string>([startKey]);
+  for (let index = 0; index < queue.length; index += 1) {
+    const voxel = queue[index];
+    const neighbors = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+    neighbors.forEach(([dx, dy, dz]) => {
+      const key = keyOf(voxel.x + dx, voxel.y + dy, voxel.z + dz);
+      const candidate = voxels.get(key);
+      if (candidate?.color === sourceColor && !visited.has(key)) {
+        visited.add(key);
+        queue.push(candidate);
       }
-    }
-  } else if (type === 'sphere') {
-    for (let z = 0; z < size.z; z += 1) {
-      for (let y = 0; y < size.y; y += 1) {
-        for (let x = 0; x < size.x; x += 1) {
-          const distance = ellipseAxisDistance(x, size.x)
-            + ellipseAxisDistance(y, size.y)
-            + ellipseAxisDistance(z, size.z);
-          if (distance <= 1 && !append(x, y, z)) return null;
-        }
-      }
-    }
-  } else {
-    for (let y = 0; y < size.y; y += 1) {
-      for (let z = 0; z < size.z; z += 1) {
-        for (let x = 0; x < size.x; x += 1) {
-          if (ellipseAxisDistance(x, size.x) + ellipseAxisDistance(z, size.z) <= 1 && !append(x, y, z)) return null;
-        }
-      }
-    }
+    });
   }
-  return offsets;
+  visited.forEach((key) => {
+    const voxel = voxels.get(key)!;
+    setVoxelData({ ...voxel, color: currentColor, texture: undefined });
+  });
+  flushVoxelChunks();
+  pushHistory();
+  showToast(`Wypełniono ${visited.size} voxeli`);
 }
 
-function addShape(position: Vector3): void {
+function replaceVoxelColor(startKey: string): void {
+  const start = voxels.get(startKey);
+  if (!start || start.color === currentColor.toLowerCase()) return;
+  let changed = 0;
+  voxels.forEach((voxel) => {
+    if (voxel.color !== start.color) return;
+    setVoxelData({ ...voxel, color: currentColor, texture: undefined });
+    changed += 1;
+  });
+  flushVoxelChunks();
+  pushHistory();
+  showToast(`Zamieniono kolor ${changed} voxeli`);
+}
+
+function handleBuildClick(position: Vector3): void {
+  const point = { x: Math.round(position.x), y: Math.max(0, Math.round(position.y)), z: Math.round(position.z) };
+  if (buildMode === 'brush') {
+    addVoxel(position);
+    return;
+  }
+  if (!buildAnchor) {
+    buildAnchor = new Vector3(point.x, point.y, point.z);
+    showToast('Pierwszy punkt ustawiony — wskaż drugi');
+    return;
+  }
+  const start = { x: Math.round(buildAnchor.x), y: Math.round(buildAnchor.y), z: Math.round(buildAnchor.z) };
+  let positions: Array<{ x: number; y: number; z: number }>;
+  if (buildMode === 'line') positions = linePositions(start, point);
+  else if (buildMode === 'rectangle') positions = cuboidPositions(start, { ...point, y: start.y });
+  else if (buildMode === 'wall') {
+    const baseLine = linePositions({ ...start, y: 0 }, { ...point, y: 0 });
+    positions = [];
+    for (let y = Math.min(start.y, point.y); y <= Math.max(start.y, point.y); y += 1) {
+      baseLine.forEach((base) => positions.push({ x: base.x, y, z: base.z }));
+    }
+  } else positions = cuboidPositions(start, point, buildMode === 'hollow');
+  buildAnchor = null;
+  const added = addVoxelPositions(positions);
+  showToast(`Dodano ${added} voxeli`);
+}
+
+let activeShapeWorker: Worker | null = null;
+let shapeGenerationCancelled = false;
+let cancelActiveShapeWorker: (() => void) | null = null;
+let shapeGenerationActive = false;
+
+function setWorkStatus(label = 'Gotowy', busy = false): void {
+  const status = document.querySelector('#workStatus')!;
+  status.textContent = label;
+  document.querySelector('#cancelWork')?.toggleAttribute('hidden', !busy);
+}
+
+function finishShapeWork(): void {
+  shapeGenerationActive = false;
+  setWorkStatus();
+}
+
+function generateShapeInWorker(type: VoxelShapeType, size: { x: number; y: number; z: number }, limit: number): Promise<Array<[number, number, number]> | null> {
+  activeShapeWorker?.terminate();
+  const worker = new Worker(new URL('./shape-worker.ts', import.meta.url), { type: 'module' });
+  activeShapeWorker = worker;
+  return new Promise((resolve, reject) => {
+    cancelActiveShapeWorker = () => {
+      worker.terminate();
+      if (activeShapeWorker === worker) activeShapeWorker = null;
+      cancelActiveShapeWorker = null;
+      resolve(null);
+    };
+    worker.onmessage = (event: MessageEvent<{ offsets: Array<[number, number, number]> | null }>) => {
+      worker.terminate();
+      if (activeShapeWorker === worker) activeShapeWorker = null;
+      cancelActiveShapeWorker = null;
+      resolve(event.data.offsets);
+    };
+    worker.onerror = (event) => {
+      worker.terminate();
+      if (activeShapeWorker === worker) activeShapeWorker = null;
+      cancelActiveShapeWorker = null;
+      reject(event.error ?? new Error(event.message));
+    };
+    worker.postMessage({ type, size, limit });
+  });
+}
+
+async function addShape(position: Vector3): Promise<void> {
   const logical = new Vector3(Math.round(position.x), Math.max(0, Math.round(position.y)), Math.round(position.z));
   if (isVoxelShape(currentShape)) {
-    const offsets = generateVoxelShapeOffsets(currentShape, currentShapeSize);
-    if (!offsets) {
-      showToast(`Kształt przekracza limit ${MAX_VOXEL_SHAPE_VOXELS} voxeli`, true);
+    if (shapeGenerationActive) {
+      showToast('Poczekaj na zakończenie bieżącej operacji', true);
       return;
     }
-    const positions = offsets.map((offset) => logical.add(offset));
+    const available = MAX_PROJECT_VOXELS - voxels.size;
+    if (available <= 0) {
+      showToast(`Projekt osiągnął limit ${MAX_PROJECT_VOXELS.toLocaleString('pl-PL')} voxeli`, true);
+      return;
+    }
+    shapeGenerationCancelled = false;
+    shapeGenerationActive = true;
+    setWorkStatus('Generowanie kształtu…', true);
+    let offsets: Array<[number, number, number]> | null;
+    try {
+      offsets = await generateShapeInWorker(currentShape, currentShapeSize, available);
+    } catch {
+      finishShapeWork();
+      showToast('Nie udało się wygenerować kształtu', true);
+      return;
+    }
+    if (shapeGenerationCancelled) {
+      finishShapeWork();
+      showToast('Generowanie anulowane');
+      return;
+    }
+    if (!offsets) {
+      finishShapeWork();
+      showToast(`Kształt przekracza dostępny limit ${available.toLocaleString('pl-PL')} voxeli`, true);
+      return;
+    }
+    const positions = withSymmetry(offsets.map(([x, y, z]) => ({ x: logical.x + x, y: logical.y + y, z: logical.z + z })))
+      .map((point) => new Vector3(point.x, point.y, point.z));
+    if (positions.length > available) {
+      finishShapeWork();
+      showToast(`Kształt z symetrią przekracza dostępny limit ${available.toLocaleString('pl-PL')} voxeli`, true);
+      return;
+    }
     if (positions.some(isPositionOccupied)) {
+      finishShapeWork();
       showToast('Kształt nachodzi na istniejący model', true);
       return;
     }
-    positions.forEach((voxelPosition) => {
+    const addedKeys: string[] = [];
+    for (let index = 0; index < positions.length; index += 1) {
+      const voxelPosition = positions[index];
       const pixelColor = currentTexturePixels ? sampleTextureColor(voxelPosition) : null;
       createVoxel({
         x: voxelPosition.x,
         y: voxelPosition.y,
         z: voxelPosition.z,
         color: pixelColor ?? currentColor,
+        group: activeGroup,
       });
-    });
+      addedKeys.push(keyOf(voxelPosition.x, voxelPosition.y, voxelPosition.z));
+      if (index > 0 && index % 2_000 === 0) {
+        setWorkStatus(`Dodawanie ${Math.round(index / positions.length * 100)}%`, true);
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        if (shapeGenerationCancelled) {
+          addedKeys.forEach(deleteVoxelData);
+          flushVoxelChunks();
+          finishShapeWork();
+          showToast('Generowanie anulowane');
+          return;
+        }
+      }
+    }
+    flushVoxelChunks();
     pushHistory();
     updateStats();
+    finishShapeWork();
     showToast(`${shapeNames[currentShape]}: dodano ${positions.length} voxeli 1 × 1 × 1`);
     return;
   }
@@ -1746,23 +2238,28 @@ function addShape(position: Vector3): void {
     sizeY: currentShapeSize.y,
     sizeZ: currentShapeSize.z,
     ...(currentTexture ? { texture: currentTexture } : {}),
+    group: activeGroup,
   });
   pushHistory();
   updateStats();
 }
 
-function eraseObject(mesh: Mesh): void {
+function eraseObject(mesh: Mesh, voxelKey?: string | null): void {
   clearHoverOutline(mesh);
   hoveredMesh = null;
-  if (mesh.metadata.isVoxel) {
-    const position = mesh.metadata.logicalPosition as Vector3;
-    voxels.delete(keyOf(position.x, position.y, position.z));
+  if (mesh.metadata.isVoxelChunk) {
+    const voxel = getVoxelFromMesh(mesh, voxelKey);
+    if (!voxel) return;
+    const key = keyOf(voxel.x, voxel.y, voxel.z);
+    deleteVoxelData(key);
+    if (selectedVoxelKeys.delete(key)) refreshVoxelSelection();
   } else {
     if (selectedPrimitiveId === String(mesh.metadata.id)) clearSelection();
     primitives.delete(String(mesh.metadata.id));
     disposeBoxPaintResources(mesh);
+    mesh.dispose();
   }
-  mesh.dispose();
+  flushVoxelChunks();
   pushHistory();
   updateStats();
 }
@@ -1773,7 +2270,7 @@ function getBoxSurfaceCell(
   uv: { x: number; y: number } | null,
 ): { key: string; face: number; u: number; v: number } | null {
   const kind = mesh.metadata.kind as ShapeType | 'voxel';
-  if (mesh.metadata.isVoxel || (kind !== 'box' && kind !== 'square') || !uv) return null;
+  if (mesh.metadata.isVoxelChunk || (kind !== 'box' && kind !== 'square') || !uv) return null;
   const face = boxFaceFromNormal(normal);
   if (face === null) return null;
   const size = boxFaceGridSize(mesh, face);
@@ -1796,6 +2293,8 @@ function sampleObjectColor(
   normal: Vector3 | null,
   uv: { x: number; y: number } | null,
 ): string {
+  const voxel = getVoxelFromMesh(mesh);
+  if (voxel) return voxel.color;
   const cell = getBoxSurfaceCell(mesh, normal, uv);
   if (cell) {
     const paintedColor = getPaintCells(mesh).get(cell.key);
@@ -1815,38 +2314,76 @@ function paintObject(
   normal: Vector3 | null = null,
   uv: { x: number; y: number } | null = null,
 ): boolean {
-  const logical = getLogicalPosition(mesh);
+  const voxel = getVoxelFromMesh(mesh);
   const paintCell = getBoxSurfaceCell(mesh, normal, uv);
-  const targetKey = paintCell
-    ? `p-${String(mesh.metadata.id)}-${paintCell.key}`
-    : mesh.metadata.isVoxel ? `v-${keyOf(logical.x, logical.y, logical.z)}` : `p-${String(mesh.metadata.id)}`;
-  if (!commit && paintedInStroke.has(targetKey)) return false;
+  const brushColor = currentColor.toLowerCase();
+  let changed = false;
+
   if (paintCell) {
     const cells = getPaintCells(mesh);
-    const brushColor = currentColor.toLowerCase();
-    const previousColor = cells.get(paintCell.key);
-    if (previousColor === brushColor) return false;
-    if (previousColor === undefined && !mesh.metadata.texture && String(mesh.metadata.color) === brushColor) return false;
     const resetsSolidBase = !mesh.metadata.texture && brushColor === String(mesh.metadata.color);
-    if (resetsSolidBase) cells.delete(paintCell.key);
-    else cells.set(paintCell.key, brushColor);
-    ensureBoxPaintResources(mesh);
-    if (resetsSolidBase) drawBoxPaintFace(mesh, paintCell.face);
-    else drawBoxPaintCell(mesh, paintCell.face, paintCell.u, paintCell.v, brushColor);
+    const faceSize = boxFaceGridSize(mesh, paintCell.face);
+    const changedCells: Array<{ u: number; v: number }> = [];
+    const offsets = centeredBrushOffsets(paintBrushSize);
+    offsets.forEach((offsetU) => {
+      offsets.forEach((offsetV) => {
+        const u = paintCell.u + offsetU;
+        const v = paintCell.v + offsetV;
+        if (u < 0 || v < 0 || u >= faceSize.width || v >= faceSize.height) return;
+        const cellKey = `${paintCell.face}:${u}:${v}`;
+        const targetKey = `p-${String(mesh.metadata.id)}-${cellKey}`;
+        if (!commit && paintedInStroke.has(targetKey)) return;
+        const previousColor = cells.get(cellKey);
+        if (previousColor === brushColor) return;
+        if (previousColor === undefined && resetsSolidBase) return;
+        if (resetsSolidBase) cells.delete(cellKey);
+        else cells.set(cellKey, brushColor);
+        if (!commit) paintedInStroke.add(targetKey);
+        changedCells.push({ u, v });
+      });
+    });
+    changed = changedCells.length > 0;
+    if (changed) {
+      ensureBoxPaintResources(mesh);
+      if (resetsSolidBase) drawBoxPaintFace(mesh, paintCell.face);
+      else {
+        changedCells.forEach((cell) => fillBoxPaintCell(mesh, paintCell.face, cell.u, cell.v, brushColor));
+        schedulePaintTextureUpdate(mesh, paintCell.face);
+      }
+    }
+  } else if (voxel) {
+    const surfaceNormal = dominantGridNormal(normal);
+    voxelBrushPositions(voxel, surfaceNormal, paintBrushSize).forEach((position) => {
+      const targetKey = `v-${keyOf(position.x, position.y, position.z)}`;
+      if (!commit && paintedInStroke.has(targetKey)) return;
+      const target = voxels.get(keyOf(position.x, position.y, position.z));
+      if (!target || target.color === brushColor && !target.texture) return;
+      const outwardNeighbor = keyOf(
+        position.x + surfaceNormal.x,
+        position.y + surfaceNormal.y,
+        position.z + surfaceNormal.z,
+      );
+      if (voxels.has(outwardNeighbor)) return;
+      setVoxelData({ ...target, color: brushColor, texture: undefined });
+      if (!commit) paintedInStroke.add(targetKey);
+      changed = true;
+    });
   } else {
-    if (mesh.metadata.color === currentColor.toLowerCase() && !mesh.metadata.texture) return false;
-    if (!mesh.metadata.isVoxel) clearPrimitivePaint(mesh);
+    const targetKey = `p-${String(mesh.metadata.id)}`;
+    if (!commit && paintedInStroke.has(targetKey)) return false;
+    if (mesh.metadata.color === brushColor && !mesh.metadata.texture) return false;
+    clearPrimitivePaint(mesh);
     // Kształty bez siatki UV nadal są malowane całym materiałem.
     mesh.metadata.texture = undefined;
     mesh.material = getMaterial(currentColor, undefined, mesh.metadata.kind === 'billboard');
-    mesh.metadata.color = currentColor.toLowerCase();
+    mesh.metadata.color = brushColor;
+    if (!commit) paintedInStroke.add(targetKey);
+    changed = true;
   }
+  if (!changed) return false;
   if (commit) pushHistory();
-  else {
-    paintedInStroke.add(targetKey);
-    paintStrokeChanged = true;
-  }
-  return true;
+  else paintStrokeChanged = true;
+  return changed;
 }
 
 function finishPaintStroke(): void {
@@ -1873,21 +2410,20 @@ function pointOnPointerPlane(plane: Plane): Vector3 | null {
 }
 
 function textureObject(mesh: Mesh): void {
-  if (mesh.metadata.isVoxel && currentTexturePixels) {
+  if (mesh.metadata.isVoxelChunk && currentTexturePixels) {
     voxels.forEach((voxel) => {
-      const sampledColor = sampleTextureColor(getLogicalPosition(voxel));
+      const sampledColor = sampleTextureColor(new Vector3(voxel.x, voxel.y, voxel.z));
       if (!sampledColor) return;
-      voxel.metadata.texture = undefined;
-      voxel.metadata.color = sampledColor;
-      voxel.material = getMaterial(sampledColor);
+      setVoxelData({ ...voxel, texture: undefined, color: sampledColor });
     });
+    flushVoxelChunks();
     pushHistory();
     showToast(`Tekstura dopasowana 1:1 do ${voxels.size} voxeli — możesz dalej rysować`);
     return;
   }
   const nextTexture = currentTexture ?? undefined;
   if (mesh.metadata.texture === nextTexture && (!mesh.metadata.paintCells || mesh.metadata.paintCells.size === 0)) return;
-  if (!mesh.metadata.isVoxel) clearPrimitivePaint(mesh);
+  if (!mesh.metadata.isVoxelChunk) clearPrimitivePaint(mesh);
   mesh.metadata.texture = nextTexture;
   const kind = mesh.metadata.kind as ShapeType;
   if (nextTexture && currentTexturePixels && (kind === 'box' || kind === 'square')) {
@@ -1933,19 +2469,16 @@ function stampTextureOnObject(
       }
     }
     if (changed) schedulePaintTextureUpdate(mesh, surfaceCell.face);
-  } else if (mesh.metadata.isVoxel) {
+  } else if (mesh.metadata.isVoxelChunk) {
     const anchor = getLogicalPosition(mesh);
     const stampSize = getStampPixelSize();
-    const startX = anchor.x - Math.floor(stampSize.width / 2);
-    const startZ = anchor.z - Math.floor(stampSize.height / 2);
     for (let y = 0; y < stampSize.height; y += 1) {
       for (let x = 0; x < stampSize.width; x += 1) {
-        const voxel = voxels.get(keyOf(startX + x, anchor.y, startZ + y));
+        const target = voxelStampPosition(anchor, stampSize, { x, y });
+        const voxel = voxels.get(keyOf(target.x, anchor.y, target.z));
         const color = stampPixelColorAt(x, y);
-        if (!voxel || !color || voxel.metadata.color === color) continue;
-        voxel.metadata.texture = undefined;
-        voxel.metadata.color = color;
-        voxel.material = getMaterial(color);
+        if (!voxel || !color || voxel.color === color) continue;
+        setVoxelData({ ...voxel, texture: undefined, color });
         changed += 1;
       }
     }
@@ -1958,12 +2491,28 @@ function stampTextureOnObject(
     return false;
   }
   flushPaintTextureUpdates();
+  flushVoxelChunks();
   pushHistory();
   showToast(`Przystemplowano ${changed} ${changed === 1 ? 'piksel' : 'pikseli'}`);
   return true;
 }
 
+function setVoxelPickContext(mesh: Mesh | null, faceId: number): string | null {
+  if (!mesh?.metadata?.isVoxelChunk) return null;
+  const key = voxelKeyFromFace(mesh, faceId);
+  mesh.metadata.activeVoxelKey = key;
+  return key;
+}
+
+function getVoxelFromMesh(mesh: Mesh, explicitKey?: string | null): VoxelData | undefined {
+  if (!mesh.metadata?.isVoxelChunk) return undefined;
+  const key = explicitKey ?? String(mesh.metadata.activeVoxelKey ?? '');
+  return key ? voxels.get(key) : undefined;
+}
+
 function getLogicalPosition(mesh: Mesh): Vector3 {
+  const voxel = getVoxelFromMesh(mesh);
+  if (voxel) return new Vector3(voxel.x, voxel.y, voxel.z);
   return mesh.metadata?.logicalPosition instanceof Vector3 ? mesh.metadata.logicalPosition : mesh.position;
 }
 
@@ -2002,6 +2551,7 @@ scene.onPointerObservable.add((pointerInfo) => {
     let pickedMesh = pick?.hit && pick.pickedMesh ? pick.pickedMesh as Mesh : null;
     let pickedPoint = pick?.hit && pick.pickedPoint ? pick.pickedPoint : null;
     let normal = pick?.hit ? pick.getNormal(true) : null;
+    const nextVoxelKey = pickedMesh ? setVoxelPickContext(pickedMesh, pick?.faceId ?? -1) : null;
     if ((!pickedMesh || !pickedPoint) && (currentTool === 'add' || currentTool === 'shape')) {
       pickedPoint = pointOnPointerPlane(infiniteGroundPlane);
       if (pickedPoint) {
@@ -2018,11 +2568,13 @@ scene.onPointerObservable.add((pointerInfo) => {
     }
 
     const nextHovered = pickedMesh.metadata?.isModel ? pickedMesh : null;
-    if (nextHovered !== hoveredMesh || hoveredTool !== currentTool) {
+    if (nextHovered !== hoveredMesh || hoveredTool !== currentTool || nextVoxelKey !== hoveredVoxelKey) {
       clearHoverOutline(hoveredMesh);
       hoveredMesh = nextHovered;
       hoveredTool = currentTool;
-      if (hoveredMesh) applyHoverOutline(hoveredMesh);
+      if (hoveredMesh) applyHoverOutline(hoveredMesh, normal);
+    } else if (hoveredMesh?.metadata?.isVoxelChunk && currentTool === 'paint') {
+      applyHoverOutline(hoveredMesh, normal);
     }
 
     if (currentTool === 'paint' && textureStampPending && pickedMesh.metadata?.isModel) {
@@ -2047,13 +2599,18 @@ scene.onPointerObservable.add((pointerInfo) => {
     const event = pointerInfo.event as PointerEvent;
     const pick = pointerInfo.pickInfo;
     if (event.button === 2) {
-      if (pick?.hit && pick.pickedMesh?.metadata?.isModel) eraseObject(pick.pickedMesh as Mesh);
+      if (pick?.hit && pick.pickedMesh?.metadata?.isModel) {
+        const pickedMesh = pick.pickedMesh as Mesh;
+        const voxelKey = setVoxelPickContext(pickedMesh, pick.faceId);
+        eraseObject(pickedMesh, voxelKey);
+      }
       return;
     }
     if (event.button !== 0) return;
     let mesh = pick?.hit && pick.pickedMesh ? pick.pickedMesh as Mesh : null;
     let point = pick?.hit && pick.pickedPoint ? pick.pickedPoint : null;
     let normal = pick?.hit ? pick.getNormal(true) : null;
+    if (mesh) setVoxelPickContext(mesh, pick?.faceId ?? -1);
     if ((!mesh || !point) && (currentTool === 'add' || currentTool === 'shape')) {
       point = pointOnPointerPlane(infiniteGroundPlane);
       if (point) {
@@ -2063,11 +2620,15 @@ scene.onPointerObservable.add((pointerInfo) => {
     }
     if (!mesh || !point) return;
     if (currentTool === 'select' && mesh.metadata?.isModel) {
-      selectPrimitive(mesh);
+      if (mesh.metadata.isVoxelChunk) selectVoxel(mesh, event.shiftKey, event.ctrlKey || event.metaKey);
+      else selectPrimitive(mesh);
     } else if (currentTool === 'add') {
-      addVoxel(getSnappedEditPosition(mesh, point, normal));
+      const pickedVoxel = getVoxelFromMesh(mesh);
+      if (buildMode === 'fill' && pickedVoxel) floodFillVoxel(keyOf(pickedVoxel.x, pickedVoxel.y, pickedVoxel.z));
+      else if (buildMode === 'replace' && pickedVoxel) replaceVoxelColor(keyOf(pickedVoxel.x, pickedVoxel.y, pickedVoxel.z));
+      else handleBuildClick(getSnappedEditPosition(mesh, point, normal));
     } else if (currentTool === 'shape') {
-      addShape(getSnappedEditPosition(mesh, point, normal));
+      void addShape(getSnappedEditPosition(mesh, point, normal));
     } else if (mesh.metadata?.isModel && currentTool === 'erase') {
       eraseObject(mesh);
     } else if (mesh.metadata?.isModel && currentTool === 'eyedropper') {
@@ -2114,6 +2675,7 @@ canvas.addEventListener('pointermove', (event) => {
     );
     hideStampPreviews();
     if (stampPick?.hit && stampPick.pickedMesh && stampPick.pickedPoint) {
+      setVoxelPickContext(stampPick.pickedMesh as Mesh, stampPick.faceId);
       updateStampPreview(
         stampPick.pickedMesh as Mesh,
         stampPick.getNormal(true),
@@ -2129,7 +2691,9 @@ canvas.addEventListener('pointermove', (event) => {
     (candidate) => Boolean(candidate.metadata?.isModel),
   );
   if (pick?.hit && pick.pickedMesh?.metadata?.isModel) {
-    paintObject(pick.pickedMesh as Mesh, false, pick.getNormal(true), pick.getTextureCoordinates());
+    const pickedMesh = pick.pickedMesh as Mesh;
+    setVoxelPickContext(pickedMesh, pick.faceId);
+    paintObject(pickedMesh, false, pick.getNormal(true), pick.getTextureCoordinates());
   }
 });
 
@@ -2139,7 +2703,7 @@ canvas.addEventListener('dblclick', () => {
   const pick = scene.pick(
     scene.pointerX,
     scene.pointerY,
-    (candidate) => Boolean(candidate.metadata?.isModel && !candidate.metadata?.isVoxel),
+    (candidate) => Boolean(candidate.metadata?.isModel && !candidate.metadata?.isVoxelChunk),
   );
   if (!pick?.hit || !pick.pickedMesh) return;
   selectPrimitive(pick.pickedMesh as Mesh, 'move');
@@ -2149,6 +2713,7 @@ canvas.addEventListener('dblclick', () => {
 function setTool(tool: Tool): void {
   finishPaintStroke();
   currentTool = tool;
+  if (tool !== 'add') buildAnchor = null;
   if (tool !== 'select') attachTransformGizmo(null);
   else if (selectedPrimitiveId) {
     const selected = primitives.get(selectedPrimitiveId);
@@ -2319,8 +2884,46 @@ PALETTE.forEach((color) => {
 });
 setColor(currentColor);
 
+const paintBrushSizeInput = document.querySelector('#paintBrushSize') as HTMLInputElement;
+paintBrushSizeInput.addEventListener('input', () => {
+  paintBrushSize = Math.max(1, Math.min(15, Math.round(Number(paintBrushSizeInput.value) || 1)));
+  if (paintBrushSize % 2 === 0) paintBrushSize += paintBrushSize < 15 ? 1 : -1;
+  paintBrushSizeInput.value = String(paintBrushSize);
+  document.querySelector('#paintBrushSizeValue')!.textContent = `${paintBrushSize} × ${paintBrushSize}`;
+  if (hoveredMesh?.metadata?.isVoxelChunk && currentTool === 'paint') {
+    applyHoverOutline(hoveredMesh, lastHoveredSurfaceNormal);
+  }
+  requestSceneRender();
+});
+
+let recentColors = (() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem('cubeling-recent-colors') ?? '[]') as unknown;
+    return Array.isArray(saved) ? saved.filter((color): color is string => typeof color === 'string' && /^#[0-9a-f]{6}$/i.test(color)).slice(0, 8) : [];
+  } catch { return [] as string[]; }
+})();
+
+function renderRecentColors(): void {
+  const container = document.querySelector('#recentPalette')!;
+  container.replaceChildren();
+  recentColors.forEach((color) => {
+    const button = document.createElement('button');
+    button.style.background = color;
+    button.title = `Ostatni kolor ${color.toUpperCase()}`;
+    button.addEventListener('click', () => activateColorBrush(color));
+    container.append(button);
+  });
+}
+renderRecentColors();
+
 document.querySelector('#customColor')!.addEventListener('input', (event) => {
   activateColorBrush((event.target as HTMLInputElement).value);
+});
+document.querySelector('#customColor')!.addEventListener('change', (event) => {
+  const color = (event.target as HTMLInputElement).value.toLowerCase();
+  recentColors = [color, ...recentColors.filter((item) => item !== color)].slice(0, 8);
+  localStorage.setItem('cubeling-recent-colors', JSON.stringify(recentColors));
+  renderRecentColors();
 });
 
 function setCurrentTexture(
@@ -2629,71 +3232,98 @@ document.querySelector('#applyTextureAllBtn')!.addEventListener('click', () => {
     showToast('Nie ma voxeli do teksturowania', true);
     return;
   }
-  voxels.forEach((mesh) => {
-    const sampledColor = sampleTextureColor(getLogicalPosition(mesh));
+  voxels.forEach((voxel) => {
+    const sampledColor = sampleTextureColor(new Vector3(voxel.x, voxel.y, voxel.z));
     if (!sampledColor) return;
-    mesh.metadata.texture = undefined;
-    mesh.metadata.color = sampledColor;
-    mesh.material = getMaterial(sampledColor);
+    setVoxelData({ ...voxel, texture: undefined, color: sampledColor });
   });
+  flushVoxelChunks();
   texturePlacementPending = false;
   document.querySelector('#textureHelp')!.textContent = 'Tekstura została dopasowana do voxeli. Możesz dalej malować kolorami.';
   pushHistory();
   showToast(`Tekstura została rozłożona 1:1 na ${voxels.size} voxelach`);
 });
 
-function allLogicalPositions(): Array<{ x: number; y: number; z: number }> {
-  const primitiveBounds = serializePrimitives().flatMap((item) => [
-    { x: item.x, y: item.y, z: item.z },
-    { x: item.x + (item.sizeX ?? 1) - 1, y: item.y + (item.sizeY ?? 1) - 1, z: item.z + (item.sizeZ ?? 1) - 1 },
-  ]);
-  return [
-    ...serializeVoxels().map(({ x, y, z }) => ({ x, y, z })),
-    ...primitiveBounds,
-  ];
-}
-
 function updateStats(): void {
-  const data = allLogicalPositions();
+  const stats = calculateModelStats(voxels.values(), serializePrimitives());
   const voxelCount = voxels.size;
   const shapeCount = primitives.size;
   const parts: string[] = [];
   if (voxelCount) parts.push(`${voxelCount} ${voxelCount === 1 ? 'voxel' : voxelCount < 5 ? 'voxele' : 'voxeli'}`);
   if (shapeCount) parts.push(`${shapeCount} ${shapeCount === 1 ? 'kształt' : shapeCount < 5 ? 'kształty' : 'kształtów'}`);
   document.querySelector('#voxelCount')!.textContent = parts.join(' · ') || '0 elementów';
-  const count = data.length;
-  if (!count) {
+  if (!stats.min || !stats.max) {
     document.querySelector('#modelSize')!.textContent = '0 × 0 × 0';
     document.querySelector('#layerCount')!.textContent = '0';
     camera.lowerRadiusLimit = 4;
     return;
   }
-  const xs = data.map((v) => v.x);
-  const ys = data.map((v) => v.y);
-  const zs = data.map((v) => v.z);
-  const dimensions = `${Math.max(...xs) - Math.min(...xs) + 1} × ${Math.max(...ys) - Math.min(...ys) + 1} × ${Math.max(...zs) - Math.min(...zs) + 1}`;
+  const dimensions = `${stats.max.x - stats.min.x + 1} × ${stats.max.y - stats.min.y + 1} × ${stats.max.z - stats.min.z + 1}`;
   document.querySelector('#modelSize')!.textContent = dimensions;
-  document.querySelector('#layerCount')!.textContent = String(new Set(ys).size);
+  document.querySelector('#layerCount')!.textContent = String(stats.layers);
   const modelDiagonal = Vector3.Distance(
-    new Vector3(Math.min(...xs), Math.min(...ys), Math.min(...zs)),
-    new Vector3(Math.max(...xs), Math.max(...ys), Math.max(...zs)),
+    new Vector3(stats.min.x, stats.min.y, stats.min.z),
+    new Vector3(stats.max.x, stats.max.y, stats.max.z),
   );
   camera.lowerRadiusLimit = Math.max(3, Math.min(12, modelDiagonal * 0.6 + 1));
   if (camera.radius < camera.lowerRadiusLimit) camera.radius = camera.lowerRadiusLimit;
 }
 
 function frameModel(): void {
-  const data = allLogicalPositions();
-  if (!data.length) {
+  const stats = calculateModelStats(voxels.values(), serializePrimitives());
+  if (!stats.min || !stats.max) {
     camera.setTarget(new Vector3(0, 1.2, 0));
     camera.radius = 18;
+    requestSceneRender(300);
     return;
   }
-  const min = new Vector3(Math.min(...data.map((v) => v.x)), Math.min(...data.map((v) => v.y)), Math.min(...data.map((v) => v.z)));
-  const max = new Vector3(Math.max(...data.map((v) => v.x)), Math.max(...data.map((v) => v.y)), Math.max(...data.map((v) => v.z)));
+  const min = new Vector3(stats.min.x, stats.min.y, stats.min.z);
+  const max = new Vector3(stats.max.x, stats.max.y, stats.max.z);
   const center = min.add(max).scale(0.5);
   camera.setTarget(center);
   camera.radius = Math.max(8, Vector3.Distance(min, max) * 2.1 + 4);
+  requestSceneRender(300);
+}
+
+function centerModelOnCanvas(): void {
+  const project = serializeProject();
+  const stats = calculateModelStats(project.voxels, project.primitives);
+  if (!stats.min || !stats.max) {
+    showToast('Nie ma modelu do wyśrodkowania', true);
+    return;
+  }
+  const canvasBounds = getCanvasBounds();
+  const dx = gridCenterOffset(stats.min.x, stats.max.x, canvasBounds.minX, canvasBounds.maxX);
+  const dz = gridCenterOffset(stats.min.z, stats.max.z, canvasBounds.minZ, canvasBounds.maxZ);
+  if (dx === 0 && dz === 0) {
+    showToast('Model jest już na środku canvasu');
+    return;
+  }
+  loadProject(translateProject(project, { x: dx, y: 0, z: dz }));
+  pushHistory();
+  requestSceneRender(500);
+  showToast(`Model wyśrodkowany na canvasie · przesunięcie X ${dx} · Z ${dz}`);
+}
+
+function moveModelVertically(offsetY: -1 | 1): void {
+  const project = serializeProject();
+  const stats = calculateModelStats(project.voxels, project.primitives);
+  if (!stats.min || !stats.max) {
+    showToast('Nie ma modelu do przesunięcia', true);
+    return;
+  }
+  if (stats.min.y + offsetY < 0) {
+    showToast('Model jest już na najniższym poziomie canvasu', true);
+    return;
+  }
+  if (stats.max.y + offsetY >= canvasSettings.height) {
+    showToast(`Model osiągnął maksymalną wysokość canvasu (${canvasSettings.height})`, true);
+    return;
+  }
+  loadProject(translateProject(project, { x: 0, y: offsetY, z: 0 }));
+  pushHistory();
+  requestSceneRender(500);
+  showToast(offsetY > 0 ? 'Podniesiono cały model o 1 voxel' : 'Obniżono cały model o 1 voxel');
 }
 
 function setProjectDirty(dirty: boolean): void {
@@ -2701,6 +3331,23 @@ function setProjectDirty(dirty: boolean): void {
   const saveState = document.querySelector('#saveState')!;
   saveState.textContent = dirty ? 'Niezapisane zmiany' : 'Projekt zapisany';
   saveState.classList.toggle('dirty', dirty);
+  window.clearTimeout(draftTimer);
+  if (!dirty) {
+    void clearDraft().catch(() => undefined);
+    return;
+  }
+  draftTimer = window.setTimeout(() => {
+    const payload: DraftPayload = {
+      format: 'cubeling',
+      version: 7,
+      name: (document.querySelector('#projectName') as HTMLInputElement).value.trim() || 'Mój model',
+      canvas: canvasSettings,
+      ...packProject(serializeProject()),
+    };
+    void saveDraft(payload).then(() => {
+      if (projectDirty) saveState.textContent = 'Szkic zapisany lokalnie';
+    }).catch(() => undefined);
+  }, 800);
 }
 
 function projectSlug(): string {
@@ -2719,8 +3366,7 @@ function downloadBlob(content: BlobPart, fileName: string, type: string): void {
 }
 
 async function exportModel(format: ExportFormat): Promise<void> {
-  const meshes = [...voxels.values(), ...primitives.values()];
-  if (!meshes.length && format !== 'json') {
+  if (!voxels.size && !primitives.size && format !== 'json') {
     showToast('Dodaj przynajmniej jeden obiekt', true);
     return;
   }
@@ -2728,43 +3374,78 @@ async function exportModel(format: ExportFormat): Promise<void> {
   const exportButton = document.querySelector('#exportBtn') as HTMLButtonElement;
   exportButton.disabled = true;
   exportButton.classList.add('loading');
+  let exportVoxelMesh: Mesh | null = null;
   try {
     if (format === 'json') {
       const projectName = (document.querySelector('#projectName') as HTMLInputElement).value.trim() || 'Mój model';
-      const payload = { format: 'cubeling', version: 6, name: projectName, canvas: canvasSettings, ...packProject(serializeProject()) };
+      const payload = { format: 'cubeling', version: 7, name: projectName, canvas: canvasSettings, ...packProject(serializeProject()) };
       downloadBlob(JSON.stringify(payload, null, 2), `${name}.cubeling.json`, 'application/json');
       setProjectDirty(false);
-    } else if (format === 'glb') {
-      const data = await GLTF2Export.GLBAsync(scene, name, { shouldExportNode: (node) => Boolean(node.metadata?.isModel) });
-      data.downloadFiles();
-    } else if (format === 'gltf') {
-      const data = await GLTF2Export.GLTFAsync(scene, name, { shouldExportNode: (node) => Boolean(node.metadata?.isModel) });
-      data.downloadFiles();
-    } else if (format === 'obj') {
-      const data = OBJExport.OBJ(meshes, false, undefined, true);
-      downloadBlob(data, `${name}.obj`, 'text/plain');
     } else {
-      const exportMeshes = meshes.map((mesh, index) => {
-        const clone = mesh.clone(`stl-export-${index}`);
-        clone.billboardMode = Mesh.BILLBOARDMODE_NONE;
-        clone.bakeCurrentTransformIntoVertices();
-        return clone;
-      });
-      const data = STLExport.CreateSTL(exportMeshes, false, name, false, true, true) as string;
-      downloadBlob(data, `${name}.stl`, 'model/stl');
-      exportMeshes.forEach((mesh) => mesh.dispose());
+      if (voxels.size) {
+        const exportVoxels = format === 'stl-hollow' ? surfaceVoxels(voxels.values()) : [...voxels.values()];
+        const exportVoxelMap = new Map(exportVoxels.map((voxel) => [keyOf(voxel.x, voxel.y, voxel.z), voxel]));
+        exportVoxelMesh = buildVoxelChunk({
+          scene,
+          chunkKey: 'optimized-export',
+          voxels: exportVoxels,
+          getVoxel: (key) => exportVoxelMap.get(key),
+          isVisible: () => true,
+          material: voxelChunkMaterial,
+        });
+        if (exportVoxelMesh) {
+          exportVoxelMesh.name = `${name}-voxels-optimized`;
+          exportVoxelMesh.metadata = { isOptimizedExport: true };
+        }
+      }
+      const meshes = [...(exportVoxelMesh ? [exportVoxelMesh] : []), ...primitives.values()];
+      if (format === 'glb' || format === 'gltf') {
+        const { GLTF2Export } = await import('@babylonjs/serializers/glTF/2.0/glTFSerializer');
+        const options = {
+          shouldExportNode: (node: { metadata?: Record<string, unknown> }) => Boolean(
+            node.metadata?.isOptimizedExport || node.metadata?.isModel && !node.metadata?.isVoxelChunk,
+          ),
+        };
+        if (format === 'glb') {
+          const data = await GLTF2Export.GLBAsync(scene, name, options);
+          data.downloadFiles();
+        } else {
+          const data = await GLTF2Export.GLTFAsync(scene, name, options);
+          data.downloadFiles();
+        }
+      } else if (format === 'obj') {
+        const { OBJExport } = await import('@babylonjs/serializers/OBJ/objSerializer');
+        const data = OBJExport.OBJ(meshes, false, undefined, true);
+        downloadBlob(data, `${name}.obj`, 'text/plain');
+      } else {
+        const { STLExport } = await import('@babylonjs/serializers/stl/stlSerializer');
+        const exportMeshes = meshes.map((mesh, index) => {
+          const clone = mesh.clone(`stl-export-${index}`);
+          clone.billboardMode = Mesh.BILLBOARDMODE_NONE;
+          clone.bakeCurrentTransformIntoVertices();
+          return clone;
+        });
+        const data = STLExport.CreateSTL(exportMeshes, false, name, false, true, true) as string;
+        downloadBlob(data, `${name}${format === 'stl-hollow' ? '-hollow' : ''}.stl`, 'model/stl');
+        exportMeshes.forEach((mesh) => mesh.dispose());
+      }
     }
     showToast(`Eksport ${format.toUpperCase()} gotowy`);
   } catch (error) {
     console.error(error);
     showToast(`Nie udało się wyeksportować ${format.toUpperCase()}`, true);
   } finally {
+    exportVoxelMesh?.dispose(false, false);
     exportButton.disabled = false;
     exportButton.classList.remove('loading');
   }
 }
 
 function importProject(file: File): void {
+  if (file.size > MAX_IMPORT_BYTES) {
+    showToast(`Plik jest zbyt duży — maksimum ${Math.round(MAX_IMPORT_BYTES / 1024 / 1024)} MB`, true);
+    return;
+  }
   const reader = new FileReader();
   reader.onload = () => {
     try {
@@ -2790,11 +3471,13 @@ function importProject(file: File): void {
         throw new Error('Nieprawidłowe pliki w bibliotece tekstur');
       }
       if (!Array.isArray(parsed.voxels) || !parsed.voxels.every((item) => validPosition(item)
-        && (item.textureId === undefined || Number.isInteger(item.textureId)))) {
+        && (item.group === undefined || typeof item.group === 'string' && item.group.length <= 32)
+        && (item.textureId === undefined || Number.isInteger(item.textureId))) || parsed.voxels.length > MAX_PROJECT_VOXELS) {
         throw new Error('Nieprawidłowy format');
       }
       const importedPrimitives = Array.isArray(parsed.primitives) ? parsed.primitives : [];
       if (!importedPrimitives.every((item) => validPosition(item) && validShapes.includes(item.type)
+        && (item.group === undefined || typeof item.group === 'string' && item.group.length <= 32)
         && (item.sizeX === undefined || Number.isInteger(item.sizeX) && item.sizeX > 0)
         && (item.sizeY === undefined || Number.isInteger(item.sizeY) && item.sizeY > 0)
         && (item.sizeZ === undefined || Number.isInteger(item.sizeZ) && item.sizeZ > 0)
@@ -2819,8 +3502,9 @@ function importProject(file: File): void {
         (document.querySelector('#projectName') as HTMLInputElement).value = parsed.name.slice(0, 48);
         document.querySelector('#modelNameDisplay')!.textContent = parsed.name.slice(0, 48);
       }
-      history = [serializeProject()];
+      history = [];
       historyIndex = 0;
+      historyState = serializeProject();
       updateHistoryButtons();
       frameModel();
       setProjectDirty(false);
@@ -2830,6 +3514,49 @@ function importProject(file: File): void {
     }
   };
   reader.readAsText(file);
+}
+
+async function importFile(file: File): Promise<void> {
+  if (file.size > MAX_IMPORT_BYTES) {
+    showToast(`Plik jest zbyt duży — maksimum ${Math.round(MAX_IMPORT_BYTES / 1024 / 1024)} MB`, true);
+    return;
+  }
+  const extension = file.name.split('.').pop()?.toLowerCase();
+  try {
+    if (extension === 'vox') {
+      const imported = parseVox(await file.arrayBuffer());
+      loadProject({ voxels: imported, primitives: [] });
+      (document.querySelector('#projectName') as HTMLInputElement).value = file.name.replace(/\.vox$/i, '').slice(0, 48);
+      document.querySelector('#modelNameDisplay')!.textContent = (document.querySelector('#projectName') as HTMLInputElement).value;
+      history = [];
+      historyIndex = 0;
+      historyState = serializeProject();
+      updateHistoryButtons();
+      frameModel();
+      setProjectDirty(true);
+      showToast(`Zaimportowano ${imported.length} voxeli z VOX`);
+      return;
+    }
+    if (file.type.startsWith('image/')) {
+      const heightmap = window.confirm('Utworzyć mapę wysokości z jasności obrazu?\n\nOK — mapa wysokości\nAnuluj — płaski sprite voxelowy');
+      const imported = await imageToVoxels(file, heightmap);
+      loadProject({ voxels: imported, primitives: [] });
+      (document.querySelector('#projectName') as HTMLInputElement).value = file.name.replace(/\.[^.]+$/, '').slice(0, 48);
+      document.querySelector('#modelNameDisplay')!.textContent = (document.querySelector('#projectName') as HTMLInputElement).value;
+      history = [];
+      historyIndex = 0;
+      historyState = serializeProject();
+      updateHistoryButtons();
+      frameModel();
+      setProjectDirty(true);
+      showToast(`Utworzono ${imported.length} voxeli z obrazu`);
+      return;
+    }
+    importProject(file);
+  } catch (error) {
+    console.error(error);
+    showToast(error instanceof Error ? error.message : 'Nie udało się zaimportować pliku', true);
+  }
 }
 
 function showToast(message: string, error = false): void {
@@ -2885,6 +3612,9 @@ document.querySelector('#applyCanvasSettings')!.addEventListener('click', () => 
     return;
   }
   canvasSettings = next;
+  const layerInput = document.querySelector('#activeLayer') as HTMLInputElement;
+  layerInput.max = String(next.height - 1);
+  layerInput.value = String(Math.min(Number(layerInput.value), next.height - 1));
   canvasConfigured = true;
   setupModal.hidden = true;
   if (currentTexture) setCurrentTexture(null);
@@ -2893,9 +3623,150 @@ document.querySelector('#applyCanvasSettings')!.addEventListener('click', () => 
   showToast(`Canvas ${next.width} × ${next.depth} jest gotowy`);
 });
 
+const activeLayerInput = document.querySelector('#activeLayer') as HTMLInputElement;
+const soloLayerInput = document.querySelector('#soloLayer') as HTMLInputElement;
+const sliceBelowInput = document.querySelector('#sliceBelow') as HTMLInputElement;
+
+function syncLayerView(): void {
+  const layer = Number(activeLayerInput.value);
+  document.querySelector('#activeLayerLabel')!.textContent = String(layer);
+  soloLayer = soloLayerInput.checked ? layer : null;
+  visibleLayerMax = sliceBelowInput.checked ? layer : Infinity;
+  rebuildAllVoxelChunks();
+}
+
+function moveLayer(delta: number): void {
+  const sourceY = Number(activeLayerInput.value);
+  const targetY = sourceY + delta;
+  if (targetY < 0 || targetY >= canvasSettings.height) {
+    showToast('Warstwa jest na granicy canvasu', true);
+    return;
+  }
+  const source = [...voxels.values()].filter((voxel) => voxel.y === sourceY);
+  if (!source.length) return;
+  const sourceKeys = new Set(source.map((voxel) => keyOf(voxel.x, voxel.y, voxel.z)));
+  if (source.some((voxel) => {
+    const targetKey = keyOf(voxel.x, targetY, voxel.z);
+    return voxels.has(targetKey) && !sourceKeys.has(targetKey);
+  })) {
+    showToast('Docelowa warstwa zawiera voxele', true);
+    return;
+  }
+  source.forEach((voxel) => deleteVoxelData(keyOf(voxel.x, voxel.y, voxel.z)));
+  source.forEach((voxel) => setVoxelData({ ...voxel, y: targetY }));
+  activeLayerInput.value = String(targetY);
+  syncLayerView();
+  pushHistory();
+  updateStats();
+}
+
+function duplicateLayer(): void {
+  const sourceY = Number(activeLayerInput.value);
+  const targetY = Math.min(canvasSettings.height - 1, sourceY + 1);
+  if (targetY === sourceY) return;
+  const source = [...voxels.values()].filter((voxel) => voxel.y === sourceY);
+  const copies = source.filter((voxel) => !voxels.has(keyOf(voxel.x, targetY, voxel.z)));
+  if (voxels.size + copies.length > MAX_PROJECT_VOXELS) {
+    showToast('Duplikowanie przekroczyłoby limit voxeli', true);
+    return;
+  }
+  copies.forEach((voxel) => setVoxelData({ ...voxel, y: targetY }));
+  activeLayerInput.value = String(targetY);
+  syncLayerView();
+  pushHistory();
+  updateStats();
+  showToast(`Zduplikowano ${copies.length} voxeli`);
+}
+
+activeLayerInput.addEventListener('input', syncLayerView);
+soloLayerInput.addEventListener('change', syncLayerView);
+sliceBelowInput.addEventListener('change', syncLayerView);
+document.querySelector('#layerDown')!.addEventListener('click', () => moveLayer(-1));
+document.querySelector('#layerUp')!.addEventListener('click', () => moveLayer(1));
+document.querySelector('#duplicateLayer')!.addEventListener('click', duplicateLayer);
+document.querySelector('#deleteLayer')!.addEventListener('click', () => {
+  const y = Number(activeLayerInput.value);
+  const keys = [...voxels.entries()].filter(([, voxel]) => voxel.y === y).map(([key]) => key);
+  keys.forEach(deleteVoxelData);
+  flushVoxelChunks();
+  clearSelection();
+  pushHistory();
+  updateStats();
+  showToast(`Usunięto warstwę Y ${y}`);
+});
+
+(document.querySelector('#buildMode') as HTMLSelectElement).addEventListener('change', (event) => {
+  buildMode = (event.target as HTMLSelectElement).value as BuildMode;
+  buildAnchor = null;
+  setTool('add');
+});
+(document.querySelector('#symmetryX') as HTMLInputElement).addEventListener('change', (event) => { symmetryX = (event.target as HTMLInputElement).checked; });
+(document.querySelector('#symmetryZ') as HTMLInputElement).addEventListener('change', (event) => { symmetryZ = (event.target as HTMLInputElement).checked; });
+(document.querySelector('#activeGroup') as HTMLInputElement).addEventListener('input', (event) => {
+  activeGroup = (event.target as HTMLInputElement).value.trim() || 'Domyślna';
+  const hide = document.querySelector('#hideActiveGroup') as HTMLInputElement;
+  hide.checked = hiddenGroups.has(activeGroup);
+});
+(document.querySelector('#hideActiveGroup') as HTMLInputElement).addEventListener('change', (event) => {
+  if ((event.target as HTMLInputElement).checked) hiddenGroups.add(activeGroup); else hiddenGroups.delete(activeGroup);
+  syncGroupVisibility();
+});
+
+document.querySelector('#deleteSelection')!.addEventListener('click', deleteSelectedVoxels);
+document.querySelector('#recolorSelection')!.addEventListener('click', recolorSelectedVoxels);
+document.querySelector('#copySelection')!.addEventListener('click', copySelectedPrimitive);
+document.querySelector('#assignSelectionGroup')!.addEventListener('click', assignSelectionGroup);
+document.querySelectorAll<HTMLButtonElement>('[data-move]').forEach((button) => {
+  button.addEventListener('click', () => {
+    const [dx, dy, dz] = button.dataset.move!.split(',').map(Number);
+    moveSelectedVoxels(dx, dy, dz);
+  });
+});
+
+function updateOrthographicBounds(): void {
+  if (camera.mode !== Camera.ORTHOGRAPHIC_CAMERA) return;
+  const aspect = Math.max(0.1, canvas.clientWidth / Math.max(1, canvas.clientHeight));
+  const size = Math.max(4, camera.radius * 0.72);
+  camera.orthoTop = size;
+  camera.orthoBottom = -size;
+  camera.orthoLeft = -size * aspect;
+  camera.orthoRight = size * aspect;
+}
+
+function setCameraView(view: string): void {
+  if (view === 'perspective') {
+    camera.mode = Camera.PERSPECTIVE_CAMERA;
+    camera.alpha = -Math.PI / 4;
+    camera.beta = Math.PI / 3.2;
+  } else {
+    camera.mode = Camera.ORTHOGRAPHIC_CAMERA;
+    if (view === 'top') { camera.alpha = -Math.PI / 2; camera.beta = 0.01; }
+    if (view === 'front') { camera.alpha = -Math.PI / 2; camera.beta = Math.PI / 2; }
+    if (view === 'side') { camera.alpha = 0; camera.beta = Math.PI / 2; }
+    updateOrthographicBounds();
+  }
+  document.querySelector('.view-chip')!.textContent = view === 'perspective' ? 'Perspektywa' : view === 'top' ? 'Góra' : view === 'front' ? 'Przód' : 'Bok';
+  requestSceneRender(300);
+}
+
+document.querySelectorAll<HTMLButtonElement>('[data-view]').forEach((button) => button.addEventListener('click', () => setCameraView(button.dataset.view!)));
+document.querySelector('#cancelWork')!.addEventListener('click', () => {
+  shapeGenerationCancelled = true;
+  cancelActiveShapeWorker?.();
+  setWorkStatus('Anulowanie…', true);
+});
+
 document.querySelector('#undoBtn')!.addEventListener('click', undo);
 document.querySelector('#redoBtn')!.addEventListener('click', redo);
 document.querySelector('#focusBtn')!.addEventListener('click', frameModel);
+document.querySelector('#centerModelOnCanvasBtn')!.addEventListener('click', centerModelOnCanvas);
+document.querySelector('#lowerModelBtn')!.addEventListener('click', () => moveModelVertically(-1));
+document.querySelector('#raiseModelBtn')!.addEventListener('click', () => moveModelVertically(1));
+document.querySelector('#inspectorToggle')!.addEventListener('click', () => {
+  const inspector = document.querySelector('.inspector')!;
+  const open = inspector.classList.toggle('open');
+  document.querySelector('#inspectorToggle')!.setAttribute('aria-expanded', String(open));
+});
 const exportMenu = document.querySelector('#exportMenu') as HTMLElement;
 const exportButton = document.querySelector('#exportBtn') as HTMLButtonElement;
 exportButton.addEventListener('click', (event) => {
@@ -2919,7 +3790,7 @@ document.addEventListener('click', (event) => {
 document.querySelector('#importBtn')!.addEventListener('click', () => (document.querySelector('#fileInput') as HTMLInputElement).click());
 document.querySelector('#fileInput')!.addEventListener('change', (event) => {
   const input = event.target as HTMLInputElement;
-  if (input.files?.[0]) importProject(input.files[0]);
+  if (input.files?.[0]) void importFile(input.files[0]);
   input.value = '';
 });
 
@@ -2956,6 +3827,7 @@ window.addEventListener('keydown', (event) => {
   const isTyping = document.activeElement instanceof HTMLInputElement;
   const isButtonFocused = document.activeElement instanceof HTMLButtonElement;
   if (event.key === 'Escape') {
+    buildAnchor = null;
     shapePopover.hidden = true;
     shapeSizeModal.hidden = true;
     closeTextureCrop();
@@ -2987,6 +3859,11 @@ window.addEventListener('keydown', (event) => {
     return;
   }
   if (isTyping) return;
+  if (event.key === 'Delete' && selectedVoxelKeys.size) {
+    event.preventDefault();
+    deleteSelectedVoxels();
+    return;
+  }
   const modalOpen = !shapeSizeModal.hidden || !textureCropModal.hidden || !modal.hidden || !setupModal.hidden;
   if (!isButtonFocused && !modalOpen && event.code === 'Space' && textureStampPending) {
     event.preventDefault();
@@ -3006,19 +3883,52 @@ window.addEventListener('keydown', (event) => {
   if (key === 'f') frameModel();
 });
 
-function initializeProject(): void {
-  history = [serializeProject()];
+async function initializeProject(): Promise<void> {
+  let restoredDraft = false;
+  try {
+    const draft = await loadDraft<DraftPayload>();
+    if (draft?.value?.format === 'cubeling' && Array.isArray(draft.value.voxels) && draft.value.voxels.length <= MAX_PROJECT_VOXELS) {
+      const project = unpackProject(draft.value);
+      canvasSettings = isValidCanvasSettings(draft.value.canvas) ? { ...draft.value.canvas } : { ...DEFAULT_CANVAS };
+      canvasConfigured = true;
+      applyCanvasVisuals(true);
+      loadProject(project);
+      textureLibrary.clear();
+      unpackTextureLibrary(draft.value.textures ?? [], draft.value.textureLibrary ?? []).forEach((item) => textureLibrary.set(item.id, item));
+      const name = draft.value.name?.slice(0, 48) || 'Mój model';
+      (document.querySelector('#projectName') as HTMLInputElement).value = name;
+      document.querySelector('#modelNameDisplay')!.textContent = name;
+      restoredDraft = true;
+      showToast('Odzyskano lokalny szkic');
+    }
+  } catch {
+    // Brak dostępu do IndexedDB nie powinien blokować edytora.
+  }
+  history = [];
   historyIndex = 0;
+  historyState = serializeProject();
   updateHistoryButtons();
   updateStats();
-  projectDirty = false;
+  projectDirty = restoredDraft;
+  if (restoredDraft) {
+    document.querySelector('#saveState')!.textContent = 'Odzyskany szkic lokalny';
+    document.querySelector('#saveState')!.classList.add('dirty');
+  }
 }
 
-initializeProject();
-document.querySelector<HTMLButtonElement>('[data-shape="box"]')?.classList.add('selected');
-setCurrentTexture(null);
-renderTextureLibrary();
-setTool('add');
-if (!canvasConfigured) openCanvasSetup(false);
-engine.runRenderLoop(() => scene.render());
-window.addEventListener('resize', () => engine.resize());
+async function startApplication(): Promise<void> {
+  await initializeProject();
+  document.querySelector<HTMLButtonElement>('[data-shape="box"]')?.classList.add('selected');
+  setCurrentTexture(null);
+  renderTextureLibrary();
+  setTool('add');
+  if (!canvasConfigured) openCanvasSetup(false);
+  engine.runRenderLoop(() => {
+    if (performance.now() > renderUntil) return;
+    updateOrthographicBounds();
+    scene.render();
+  });
+  window.addEventListener('resize', () => { engine.resize(); requestSceneRender(300); });
+}
+
+void startApplication();

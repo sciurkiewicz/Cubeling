@@ -2,18 +2,24 @@
 
 Przeglądarkowy edytor modeli voxelowych 3D zbudowany na Babylon.js.
 
-## Funkcje
+## Najważniejsze funkcje
 
-- konfiguracja canvasu voxelowego od 8×8 do 256×256 z limitem wysokości,
-- mapowanie 1:1: jedna komórka siatki = jeden voxel = jeden piksel tekstury,
-- ciągłe rysowanie voxelami przez przeciąganie, także poza widocznym obszarem gridu,
-- wyraźne tryby „Rysuj voxele” i „Edytuj obiekt”,
-- dodawanie, usuwanie i kolorowanie voxeli,
-- malowanie kliknięciem lub przeciągnięciem pędzla po voxelach,
-- dodatkowe kształty: skalowalny Box, piramida, koło, plane i billboard; rozmiar można ustawić przed dodaniem, liczbowo po zaznaczeniu albo uchwytami X/Y/Z bezpośrednio w widoku,
-- wgrywanie tekstur PNG, JPG i WebP oraz rozkładanie ich na voxelach według pozycji na canvasie,
-- eksport do GLB, glTF 2.0, OBJ, STL i edytowalnego projektu Cubeling JSON,
-- historia zmian, automatyczny zapis lokalny i import projektu.
+- projekty do 60 000 voxeli,
+- wydajne renderowanie chunkami `16 × 16 × 16`, obejmujące tylko widoczne ściany,
+- canvas od `8 × 8 × 8` do `256 × 256 × 256`,
+- rysowanie pojedynczych voxeli, linii, ścian oraz pełnych i pustych brył,
+- wypełnienie spójnego obszaru i globalna zamiana koloru,
+- symetria względem osi X i Z,
+- zaznaczanie jednego voxela lub zakresu przez Shift+klik,
+- kopiowanie, przesuwanie, usuwanie, kolorowanie i grupowanie zaznaczenia,
+- warstwy Y z izolowaniem, przekrojem, przesuwaniem, duplikowaniem i usuwaniem,
+- widoki perspektywiczny, górny, przedni i boczny,
+- edytowalne prymitywy oraz teksturowanie i stemple pikselowe,
+- import projektu Cubeling JSON, MagicaVoxel `.vox` oraz obrazu jako sprite lub mapa wysokości,
+- eksport do zoptymalizowanego GLB, glTF 2.0, OBJ, pełnego lub pustego STL oraz Cubeling JSON,
+- historia zmian oparta na różnicach zamiast pełnych kopii projektu,
+- automatyczny szkic w IndexedDB i odzyskiwanie po odświeżeniu lub awarii,
+- interfejs mobilny z wysuwanym panelem ustawień.
 
 ## Uruchomienie
 
@@ -22,20 +28,29 @@ npm install
 npm run dev
 ```
 
-Produkcja:
+Produkcja i testy:
 
 ```bash
 npm run build
+npm test
+npm run test:e2e
 npm run preview
 ```
 
+Test `test:e2e` uruchamia lokalny Chrome lub Edge w trybie headless i sprawdza również załadowanie modelu zawierającego 60 000 voxeli.
+
 ## Sterowanie
 
-- lewy klik lub przeciągnięcie — użycie wybranego narzędzia,
-- prawy lub środkowy przycisk myszy — obrót kamery,
-- rolka — zoom,
-- `V`, `B`, `E`, `P`, `T` — wybierz, dodaj, usuń, maluj, teksturuj,
-- `F` — wycentruj model,
-- `Ctrl+Z` / `Ctrl+Shift+Z` — cofnij / ponów.
+- lewy klik — użycie wybranego narzędzia,
+- Shift+klik w trybie edycji — zaznaczenie zakresu voxeli,
+- Ctrl+klik — dodanie lub usunięcie voxela z zaznaczenia,
+- prawy klik — usunięcie voxela lub obiektu,
+- środkowy przycisk myszy — obrót kamery,
+- rolka — przybliżenie,
+- `V`, `B`, `E`, `P`, `T`, `I` — edycja, rysowanie, usuwanie, malowanie, tekstura i próbnik,
+- `F` — wycentrowanie modelu,
+- `Delete` — usunięcie zaznaczonych voxeli,
+- `Ctrl+C` / `Ctrl+V` — kopiowanie i wklejanie,
+- `Ctrl+Z` / `Ctrl+Shift+Z` — cofnięcie i ponowienie.
 
-Projekt nie jest automatycznie zapisywany ani wczytywany. Przy zamykaniu lub odświeżaniu karty z niezapisanymi zmianami przeglądarka pokazuje ostrzeżenie. Eksport do Cubeling JSON (`*.cubeling.json`) zapisuje edytowalny projekt, który można później zaimportować. Do przenoszenia modelu z teksturami najlepiej użyć GLB; STL jest przeznaczony do druku 3D, a OBJ do uniwersalnej geometrii siatkowej.
+Lokalny szkic służy do odzyskiwania pracy w tej samej przeglądarce. Eksport Cubeling JSON pozostaje przenośnym, edytowalnym zapisem projektu. GLB jest przeznaczony do gier i podglądu 3D, a STL do druku 3D.
